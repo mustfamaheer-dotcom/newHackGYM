@@ -1,0 +1,20 @@
+{
+  "code": 200,
+  "data": {
+    "description": "",
+    "html": "<html><head><meta name=\"color-scheme\" content=\"light dark\"></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\">using System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Web.Http;\nusing AttendanceSystem.Filters;\nusing Microsoft.AspNet.SignalR;\nusing Microsoft.Owin;\nusing Owin;\n\n[assembly: OwinStartup(typeof(AttendanceSystem.Startup))]\n\nnamespace AttendanceSystem\n{\n    public class Startup\n    {\n        public void Configuration(IAppBuilder app)\n        {\n            // SignalR only — Web API is configured via GlobalConfiguration in Global.asax.cs\n            var hubConfig = new HubConfiguration\n            {\n                EnableDetailedErrors = true,\n                EnableJavaScriptProxies = true\n            };\n            app.MapSignalR(\"/signalr\", hubConfig);\n        }\n    }\n}\n</pre></body></html>",
+    "httpStatus": 200,
+    "httpStatusText": "",
+    "title": "",
+    "url": "https://raw.githubusercontent.com/mustfamaheer-dotcom/TestDevice/main/backend/AttendanceSystem/Startup.cs",
+    "usage": {
+      "tokens": 178
+    }
+  },
+  "meta": {
+    "usage": {
+      "tokens": 178
+    }
+  },
+  "status": 20000
+}

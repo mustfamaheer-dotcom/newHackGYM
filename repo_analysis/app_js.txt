@@ -1,0 +1,418 @@
+// ===========================================================================
+// ZKTeco Attendance Dashboard - Frontend Logic
+// ===========================================================================
+const API_BASE = window.location.origin;
+const SIGNALR_URL = `${API_BASE}/signalr`;
+let signalrConn = null;
+// ---------------------------------------------------------------------------
+// Initialize
+// ---------------------------------------------------------------------------
+$(document).ready(() => {
+    initTime();
+    initMonthYearSelectors();
+    initSignalR();
+    loadDashboardStats();
+    loadTodayAttendance();
+    loadUsers();
+    loadDevices();
+    // Refresh stats periodically
+    setInterval(loadDashboardStats, 30000);
+    setInterval(loadTodayAttendance, 60000);
+});
+function initTime() {
+    setInterval(() => {
+        $('#currentTime').text(new Date().toLocaleString());
+    }, 1000);
+}
+function initMonthYearSelectors() {
+    const now = new Date();
+    for (let m = 1; m 
+${m}
+`);
+    }
+    for (let y = now.getFullYear() - 2; y 
+${y}
+`);
+    }
+}
+// ---------------------------------------------------------------------------
+// SignalR
+// ---------------------------------------------------------------------------
+function initSignalR() {
+    signalrConn = $.hubConnection(SIGNALR_URL, { useDefaultPath: false });
+    var hub = signalrConn.createHubProxy('attendanceHub');
+    hub.on('attendanceRecorded', function (record) {
+        prependRecord(record);
+        showToast('New ' + record.status + ' by ' + (record.userName || record.employeeId), 'success');
+        loadDashboardStats();
+    });
+    hub.on('recordsSynced', function (info) {
+        showToast('Synced ' + info.inserted + ' records from ' + info.deviceSerial, 'success');
+        loadTodayAttendance();
+        loadDashboardStats();
+    });
+    hub.on('clientCountChanged', function (count) {
+        $('#clientCount').text(count);
+    });
+    signalrConn.start()
+        .done(function () { updateConnectionStatus(true); })
+        .fail(function () {
+            updateConnectionStatus(false);
+            setTimeout(initSignalR, 5000);
+        });
+}
+function updateConnectionStatus(connected) {
+    const badge = $('#connectionStatus');
+    if (connected) {
+        badge.removeClass('badge-danger').addClass('badge-success').html(
+            '
+ Live'
+        );
+    } else {
+        badge.removeClass('badge-success').addClass('badge-danger').html(
+            '
+ Reconnecting...'
+        );
+    }
+}
+// ---------------------------------------------------------------------------
+// Dashboard stats
+// ---------------------------------------------------------------------------
+async function loadDashboardStats() {
+    try {
+        const res = await fetch(`${API_BASE}/api/attendance/dashboard-stats`);
+        const json = await res.json();
+        if (json.success) {
+            const d = json.data;
+            $('#kpiTotalUsers').text(d.totalActiveUsers);
+            $('#kpiCheckedIn').text(d.checkedInToday);
+            $('#kpiLate').text(d.lateToday);
+            $('#kpiAbsent').text(d.absentToday);
+        }
+    } catch (e) {
+        console.error('Dashboard stats error:', e);
+    }
+}
+// ---------------------------------------------------------------------------
+// Today attendance
+// ---------------------------------------------------------------------------
+async function loadTodayAttendance() {
+    try {
+        const res = await fetch(`${API_BASE}/api/attendance/today`);
+        const json = await res.json();
+        if (json.success) {
+            renderTodayRecords(json.data);
+        }
+    } catch (e) {
+        console.error('Today attendance error:', e);
+        $('#todayRecordsBody').html('
+Failed to load
+');
+    }
+}
+function renderTodayRecords(records) {
+    if (!records || records.length === 0) {
+        $('#todayRecordsBody').html('
+No attendance records today
+');
+        return;
+    }
+    const rows = records.map(r => `
+        
+            
+${new Date(r.timestamp).toLocaleTimeString()}
+            
+${r.employeeId || '-'}
+            
+${r.userName || '-'}
+            
+${r.department || '-'}
+            
+${r.status}
+            
+${r.verificationType} (${r.verificationScore}%)
+            
+${r.deviceSerialNumber || '-'}
+        
+    `).join('');
+    $('#todayRecordsBody').html(rows);
+}
+function prependRecord(record) {
+    const row = `
+        
+            
+${new Date(record.timestamp).toLocaleTimeString()}
+            
+${record.employeeId || '-'}
+            
+${record.userName || '-'}
+            
+-
+            
+${record.status}
+            
+${record.verificationType}
+            
+-
+        
+`;
+    $('#todayRecordsBody').prepend(row);
+}
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+async function loadUsers() {
+    try {
+        const res = await fetch(`${API_BASE}/api/users`);
+        const json = await res.json();
+        if (json.success) {
+            renderUsers(json.data);
+        }
+    } catch (e) {
+        console.error('Users load error:', e);
+    }
+}
+function renderUsers(users) {
+    if (!users || users.length === 0) {
+        $('#usersBody').html('
+No users
+');
+        return;
+    }
+    $('#usersBody').html(users.map(u => `
+        
+            
+${u.userId}
+            
+${u.name}
+            
+${u.employeeId}
+            
+${u.department || '-'}
+            
+${u.position || '-'}
+            
+${u.email || '-'}
+            
+${u.hasBiometric ? '
+' : '
+'}
+            
+${u.status}
+            
+                
+                
+            
+        
+    `).join(''));
+}
+function openCreateUser() {
+    $('#userModalTitle').text('Add User');
+    $('#userId').val('');
+    $('#userName, #userEmployeeId, #userEmail, #userPhone, #userDepartment, #userPosition').val('');
+}
+async function editUser(id) {
+    try {
+        const res = await fetch(`${API_BASE}/api/users/${id}`);
+        const json = await res.json();
+        if (json.success) {
+            const u = json.data;
+            $('#userModalTitle').text('Edit User');
+            $('#userId').val(u.userId);
+            $('#userName').val(u.name);
+            $('#userEmployeeId').val(u.employeeId);
+            $('#userEmail').val(u.email);
+            $('#userPhone').val(u.phoneNumber);
+            $('#userDepartment').val(u.department);
+            $('#userPosition').val(u.position);
+            $('#userModal').modal('show');
+        }
+    } catch (e) {
+        showToast('Failed to load user', 'error');
+    }
+}
+async function saveUser() {
+    const id = $('#userId').val();
+    const payload = {
+        name: $('#userName').val(),
+        employeeId: $('#userEmployeeId').val(),
+        email: $('#userEmail').val(),
+        phoneNumber: $('#userPhone').val(),
+        department: $('#userDepartment').val(),
+        position: $('#userPosition').val()
+    };
+    try {
+        const url = id ? `${API_BASE}/api/users/${id}` : `${API_BASE}/api/users`;
+        const method = id ? 'PUT' : 'POST';
+        const res = await fetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        if (json.success) {
+            $('#userModal').modal('hide');
+            showToast(id ? 'User updated' : 'User created', 'success');
+            loadUsers();
+        } else {
+            showToast(json.message || 'Failed', 'error');
+        }
+    } catch (e) {
+        showToast('Network error', 'error');
+    }
+}
+async function deleteUser(id) {
+    if (!confirm('Delete this user? Records will be preserved (soft delete).')) return;
+    try {
+        const res = await fetch(`${API_BASE}/api/users/${id}`, { method: 'DELETE' });
+        const json = await res.json();
+        if (json.success) {
+            showToast('User deleted', 'success');
+            loadUsers();
+        } else {
+            showToast(json.message || 'Failed', 'error');
+        }
+    } catch (e) {
+        showToast('Network error', 'error');
+    }
+}
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+async function loadMonthlyReport() {
+    const month = $('#reportMonth').val();
+    const year = $('#reportYear').val();
+    try {
+        const res = await fetch(`${API_BASE}/api/attendance/report/monthly?year=${year}&month=${month}`);
+        const json = await res.json();
+        if (json.success) {
+            renderReport(json.data);
+        }
+    } catch (e) {
+        showToast('Failed to load report', 'error');
+    }
+}
+function renderReport(items) {
+    if (!items || items.length === 0) {
+        $('#reportBody').html('
+No data for selected period
+');
+        return;
+    }
+    $('#reportBody').html(items.map(r => `
+        
+            
+${r.employeeId}
+            
+${r.name}
+            
+${r.department || '-'}
+            
+${r.presentDays}
+            
+${r.lateDays}
+            
+${r.absentDays}
+            
+${r.earlyLeaveDays}
+            
+${r.halfDays}
+            
+${r.onLeaveDays}
+            
+${r.totalWorkHours.toFixed(2)}h
+        
+    `).join(''));
+}
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+async function loadDevices() {
+    try {
+        const res = await fetch(`${API_BASE}/api/devices`);
+        const json = await res.json();
+        if (json.success) {
+            renderDevices(json.data);
+        }
+    } catch (e) {
+        console.error('Devices load error:', e);
+    }
+}
+function renderDevices(devices) {
+    if (!devices || devices.length === 0) {
+        $('#devicesBody').html('
+No devices registered
+');
+        return;
+    }
+    $('#devicesBody').html(devices.map(d => `
+        
+            
+${d.serialNumber}
+            
+${d.model}
+            
+${d.ipAddress}
+            
+${d.port}
+            
+${d.location || '-'}
+            
+${d.status}
+            
+${new Date(d.lastSyncedDate).toLocaleString()}
+            
+                
+            
+        
+    `).join(''));
+}
+function openCreateDevice() {
+    $('#deviceSerial, #deviceIp, #deviceLocation').val('');
+    $('#deviceModel').val('MB2000');
+    $('#devicePort').val(4370);
+}
+async function saveDevice() {
+    const payload = {
+        serialNumber: $('#deviceSerial').val(),
+        model: $('#deviceModel').val(),
+        firmwareVersion: '1.0',
+        ipAddress: $('#deviceIp').val(),
+        port: parseInt($('#devicePort').val()),
+        location: $('#deviceLocation').val()
+    };
+    try {
+        const res = await fetch(`${API_BASE}/api/devices`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        if (json.success) {
+            $('#deviceModal').modal('hide');
+            showToast('Device registered', 'success');
+            loadDevices();
+        } else {
+            showToast(json.message || 'Failed', 'error');
+        }
+    } catch (e) {
+        showToast('Network error', 'error');
+    }
+}
+async function deleteDevice(id) {
+    if (!confirm('Remove this device?')) return;
+    try {
+        await fetch(`${API_BASE}/api/devices/${id}`, { method: 'DELETE' });
+        showToast('Device removed', 'success');
+        loadDevices();
+    } catch (e) {
+        showToast('Network error', 'error');
+    }
+}
+// ---------------------------------------------------------------------------
+// Toast
+// ---------------------------------------------------------------------------
+function showToast(message, type = '') {
+    $('#toast').removeClass('success error').addClass(type).text(message).addClass('show');
+    setTimeout(() => $('#toast').removeClass('show'), 3500);
+}

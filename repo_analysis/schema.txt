@@ -1,0 +1,264 @@
+/* ===========================================================================
+   Attendance Management System - SQL Server Schema
+   ---------------------------------------------------------------------------
+   Target: SQL Server 2016+ (works on Express edition)
+   Execute: Open in SSMS, run with SQLCMD mode, or:
+           sqlcmd -S localhost -E -i schema.sql
+   Creates:
+     - Database AttendanceDB
+     - Tables: Users, Devices, AttendanceRecords, AccessLogs, AttendanceSummaries
+     - Indexes for common query patterns
+     - Views: vw_MonthlyAttendanceReport, vw_DailyAttendanceStatus
+     - Stored procedure: sp_RebuildDailySummaries
+     - Seed data: sample device, sample users
+   =========================================================================== */
+SET NOCOUNT ON;
+GO
+/* ---------- Create database ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = 'AttendanceDB')
+BEGIN
+    CREATE DATABASE AttendanceDB;
+    PRINT 'Database AttendanceDB created.';
+END
+GO
+USE AttendanceDB;
+GO
+/* ===========================================================================
+   TABLES
+   =========================================================================== */
+/* ---------- Users ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Users]') AND type = N'U')
+BEGIN
+    CREATE TABLE [dbo].[Users]
+    (
+        [UserId]             INT IDENTITY(1,1) PRIMARY KEY,
+        [Name]               NVARCHAR(100)  NOT NULL,
+        [EmployeeId]         NVARCHAR(50)   NOT NULL,
+        [Email]              NVARCHAR(255)  NULL,
+        [PhoneNumber]        NVARCHAR(20)   NULL,
+        [Department]         NVARCHAR(500)  NULL,
+        [Position]           NVARCHAR(500)  NULL,
+        [BiometricTemplate]  VARBINARY(MAX) NULL,
+        [ProfilePhoto]       VARBINARY(MAX) NULL,
+        [Status]             INT            NOT NULL DEFAULT 1,
+        [CreatedDate]        DATETIME2      NOT NULL DEFAULT SYSUTCDATETIME(),
+        [UpdatedDate]        DATETIME2      NULL,
+        CONSTRAINT [UQ_Users_EmployeeId] UNIQUE ([EmployeeId])
+    );
+    CREATE INDEX [IX_Users_Status]       ON [dbo].[Users]([Status]);
+    CREATE INDEX [IX_Users_Department]   ON [dbo].[Users]([Department]);
+    PRINT 'Table Users created.';
+END
+GO
+/* ---------- Devices ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Devices]') AND type = N'U')
+BEGIN
+    CREATE TABLE [dbo].[Devices]
+    (
+        [Id]              INT IDENTITY(1,1) PRIMARY KEY,
+        [SerialNumber]    NVARCHAR(100) NOT NULL,
+        [Model]           NVARCHAR(50)  NOT NULL,
+        [FirmwareVersion] NVARCHAR(50)  NOT NULL,
+        [IpAddress]       NVARCHAR(50)  NOT NULL,
+        [Port]            INT           NOT NULL DEFAULT 4370,
+        [Status]          INT           NOT NULL DEFAULT 1,
+        [LastSyncedDate]  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        [Location]        NVARCHAR(255) NULL,
+        [CreatedDate]     DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        [UpdatedDate]     DATETIME2     NULL,
+        CONSTRAINT [UQ_Devices_SerialNumber] UNIQUE ([SerialNumber])
+    );
+    CREATE INDEX [IX_Devices_Status] ON [dbo].[Devices]([Status]);
+    PRINT 'Table Devices created.';
+END
+GO
+/* ---------- AttendanceRecords ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[AttendanceRecords]') AND type = N'U')
+BEGIN
+    CREATE TABLE [dbo].[AttendanceRecords]
+    (
+        [Id]                  BIGINT IDENTITY(1,1) PRIMARY KEY,
+        [UserId]              INT           NOT NULL,
+        [Timestamp]           DATETIME2     NOT NULL,
+        [Status]              INT           NOT NULL,           -- 0=CheckIn, 1=CheckOut
+        [DeviceSerialNumber]  NVARCHAR(50)  NULL,
+        [VerificationType]    INT           NOT NULL DEFAULT 1, -- 1=Face (MB2000 default)
+        [VerificationScore]   INT           NOT NULL DEFAULT 0,
+        [CaptureedImage]      VARBINARY(MAX) NULL,
+        [Notes]               NVARCHAR(500) NULL,
+        [IsSynced]            BIT           NOT NULL DEFAULT 1,
+        [SyncedDate]          DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT [FK_AttendanceRecords_Users]
+            FOREIGN KEY ([UserId]) REFERENCES [dbo].[Users]([UserId]) ON DELETE CASCADE
+    );
+    CREATE INDEX [IX_AttendanceRecords_UserId_Timestamp]
+        ON [dbo].[AttendanceRecords]([UserId], [Timestamp] DESC);
+    CREATE INDEX [IX_AttendanceRecords_Timestamp]
+        ON [dbo].[AttendanceRecords]([Timestamp] DESC);
+    CREATE INDEX [IX_AttendanceRecords_Status]
+        ON [dbo].[AttendanceRecords]([Status]);
+    -- Used by de-duplication check during sync
+    CREATE INDEX [IX_AttendanceRecords_User_Ts_Device]
+        ON [dbo].[AttendanceRecords]([UserId], [Timestamp], [DeviceSerialNumber]);
+    PRINT 'Table AttendanceRecords created.';
+END
+GO
+/* ---------- AccessLogs ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[AccessLogs]') AND type = N'U')
+BEGIN
+    CREATE TABLE [dbo].[AccessLogs]
+    (
+        [Id]          BIGINT IDENTITY(1,1) PRIMARY KEY,
+        [UserId]      INT           NOT NULL,
+        [Timestamp]   DATETIME2     NOT NULL,
+        [Status]      INT           NOT NULL,    -- 1=Granted, 2=Denied
+        [DeviceId]    NVARCHAR(255) NULL,
+        [Location]    NVARCHAR(255) NULL,
+        [Reason]      NVARCHAR(500) NULL,
+        [Description] NVARCHAR(500) NULL,
+        CONSTRAINT [FK_AccessLogs_Users]
+            FOREIGN KEY ([UserId]) REFERENCES [dbo].[Users]([UserId]) ON DELETE CASCADE
+    );
+    CREATE INDEX [IX_AccessLogs_UserId_Timestamp] ON [dbo].[AccessLogs]([UserId], [Timestamp] DESC);
+    CREATE INDEX [IX_AccessLogs_Timestamp]        ON [dbo].[AccessLogs]([Timestamp] DESC);
+    CREATE INDEX [IX_AccessLogs_Status]           ON [dbo].[AccessLogs]([Status]);
+    PRINT 'Table AccessLogs created.';
+END
+GO
+/* ---------- AttendanceSummaries ---------- */
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[AttendanceSummaries]') AND type = N'U')
+BEGIN
+    CREATE TABLE [dbo].[AttendanceSummaries]
+    (
+        [Id]                INT IDENTITY(1,1) PRIMARY KEY,
+        [UserId]            INT           NOT NULL,
+        [Date]              DATE          NOT NULL,
+        [CheckInTime]       DATETIME2     NULL,
+        [CheckOutTime]      DATETIME2     NULL,
+        [WorkDuration]      TIME          NULL,
+        [AttendanceStatus]  INT           NOT NULL DEFAULT 1,
+        [Notes]             NVARCHAR(500) NULL,
+        [CreatedDate]       DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+        [UpdatedDate]       DATETIME2     NULL,
+        CONSTRAINT [FK_AttendanceSummaries_Users]
+            FOREIGN KEY ([UserId]) REFERENCES [dbo].[Users]([UserId]) ON DELETE CASCADE,
+        CONSTRAINT [UQ_AttendanceSummaries_UserId_Date]
+            UNIQUE ([UserId], [Date])
+    );
+    CREATE INDEX [IX_AttendanceSummaries_Date]              ON [dbo].[AttendanceSummaries]([Date]);
+    CREATE INDEX [IX_AttendanceSummaries_AttendanceStatus]  ON [dbo].[AttendanceSummaries]([AttendanceStatus]);
+    PRINT 'Table AttendanceSummaries created.';
+END
+GO
+/* ===========================================================================
+   VIEWS
+   =========================================================================== */
+IF NOT EXISTS (SELECT 1 FROM sys.views WHERE object_id = OBJECT_ID(N'[dbo].[vw_MonthlyAttendanceReport]'))
+BEGIN
+    EXECUTE sp_executesql N'
+    CREATE VIEW [dbo].[vw_MonthlyAttendanceReport] AS
+    SELECT
+        u.UserId,
+        u.EmployeeId,
+        u.Name,
+        u.Department,
+        YEAR(asm.[Date])  AS [Year],
+        MONTH(asm.[Date]) AS [Month],
+        COUNT(CASE WHEN asm.AttendanceStatus = 1 THEN 1 END) AS PresentDays,
+        COUNT(CASE WHEN asm.AttendanceStatus = 2 THEN 1 END) AS AbsentDays,
+        COUNT(CASE WHEN asm.AttendanceStatus = 3 THEN 1 END) AS LateDays,
+        COUNT(CASE WHEN asm.AttendanceStatus = 4 THEN 1 END) AS EarlyLeaveDays,
+        COUNT(CASE WHEN asm.AttendanceStatus = 5 THEN 1 END) AS HalfDays,
+        COUNT(CASE WHEN asm.AttendanceStatus = 6 THEN 1 END) AS OnLeaveDays,
+        AVG(CASE
+                WHEN asm.CheckInTime IS NOT NULL AND asm.CheckOutTime IS NOT NULL
+                THEN DATEDIFF(MINUTE, asm.CheckInTime, asm.CheckOutTime)
+                ELSE NULL
+            END) AS AvgWorkMinutes,
+        SUM(CASE
+                WHEN asm.CheckInTime IS NOT NULL AND asm.CheckOutTime IS NOT NULL
+                THEN DATEDIFF(MINUTE, asm.CheckInTime, asm.CheckOutTime)
+                ELSE 0
+            END) AS TotalWorkMinutes
+    FROM [dbo].[Users] u
+    LEFT JOIN [dbo].[AttendanceSummaries] asm ON u.UserId = asm.UserId
+    WHERE u.[Status] = 1
+    GROUP BY u.UserId, u.EmployeeId, u.Name, u.Department,
+             YEAR(asm.[Date]), MONTH(asm.[Date]);
+    ';
+    PRINT 'View vw_MonthlyAttendanceReport created.';
+END
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.views WHERE object_id = OBJECT_ID(N'[dbo].[vw_DailyAttendanceStatus]'))
+BEGIN
+    EXECUTE sp_executesql N'
+    CREATE VIEW [dbo].[vw_DailyAttendanceStatus] AS
+    SELECT
+        u.UserId,
+        u.EmployeeId,
+        u.Name,
+        u.Department,
+        asm.[Date]            AS AttendanceDate,
+        asm.CheckInTime,
+        asm.CheckOutTime,
+        asm.WorkDuration,
+        CASE asm.AttendanceStatus
+            WHEN 1 THEN ''Present''
+            WHEN 2 THEN ''Absent''
+            WHEN 3 THEN ''Late''
+            WHEN 4 THEN ''Early Leave''
+            WHEN 5 THEN ''Half Day''
+            WHEN 6 THEN ''On Leave''
+            ELSE ''Unknown''
+        END AS [Status]
+    FROM [dbo].[Users] u
+    LEFT JOIN [dbo].[AttendanceSummaries] asm ON u.UserId = asm.UserId
+    WHERE u.[Status] = 1;
+    ';
+    PRINT 'View vw_DailyAttendanceStatus created.';
+END
+GO
+/* ===========================================================================
+   STORED PROCEDURES
+   =========================================================================== */
+-- Rebuild daily summaries for a date range. Useful when policy changes
+-- require recomputing historical status values.
+IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[sp_RebuildDailySummaries]') AND type = N'P')
+BEGIN
+    EXECUTE sp_executesql N'
+    CREATE PROCEDURE [dbo].[sp_RebuildDailySummaries]
+        @StartDate DATE,
+        @EndDate   DATE
+    AS
+    BEGIN
+        SET NOCOUNT ON;
+        DECLARE @LateThreshold TIME = ''09:15:00'';
+        DECLARE @EarlyLeaveThreshold TIME = ''17:00:00'';
+        DECLARE @HalfDayMinMinutes INT = 240;
+        ;WITH dayRecords AS (
+            SELECT
+                ar.UserId,
+                CAST(ar.Timestamp AS DATE) AS WorkDate,
+                MIN(CASE WHEN ar.Status = 0 THEN ar.Timestamp END) AS CheckInTime,
+                MAX(CASE WHEN ar.Status = 1 THEN ar.Timestamp END) AS CheckOutTime,
+                DATEDIFF(MINUTE,
+                    MIN(CASE WHEN ar.Status = 0 THEN ar.Timestamp END),
+                    MAX(CASE WHEN ar.Status = 1 THEN ar.Timestamp END)
+                ) AS WorkMinutes
+            FROM [dbo].[AttendanceRecords] ar
+            WHERE CAST(ar.Timestamp AS DATE) BETWEEN @StartDate AND @EndDate
+            GROUP BY ar.UserId, CAST(ar.Timestamp AS DATE)
+        )
+        MERGE [dbo].[AttendanceSummaries] AS target
+        USING (
+            SELECT
+                u.UserId,
+                dr.WorkDate,
+                dr.CheckInTime,
+                dr.CheckOutTime,
+                dr.WorkMinutes,
+                CASE
+                    WHEN dr.CheckInTime IS NULL THEN 2  -- Absent
+                    WHEN dr.WorkMinutes 
+ @LateThreshold THEN 3  -- Late
+                    WHEN dr.CheckOutTime IS NOT NULL AND CAST(dr.CheckOutTime AS TIME)

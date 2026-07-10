@@ -1,0 +1,374 @@
+ZKTeco Attendance Dashboard
+    
+    
+    
+    
+        
+            
+            ZKTeco Attendance System
+        
+        
+            
+                
+ Live
+            
+            
+            
+Connected clients: 
+-
+        
+    
+    
+        
+        
+            
+                
+                    
+                        
+                            
+                                
+Active Users
+                                
+-
+                            
+                            
+                        
+                    
+                
+            
+            
+                
+                    
+                        
+                            
+                                
+Checked In Today
+                                
+-
+                            
+                            
+                        
+                    
+                
+            
+            
+                
+                    
+                        
+                            
+                                
+Late Today
+                                
+-
+                            
+                            
+                        
+                    
+                
+            
+            
+                
+                    
+                        
+                            
+                                
+Absent Today
+                                
+-
+                            
+                            
+                        
+                    
+                
+            
+        
+        
+        
+            
+                
+                    
+ Live Attendance
+                
+            
+            
+                
+                    
+ Users
+                
+            
+            
+                
+                    
+ Reports
+                
+            
+            
+                
+                    
+ Devices
+                
+            
+        
+        
+            
+            
+                
+                    
+ Today's Attendance Records
+                    
+                        
+ Refresh
+                    
+                
+                
+                    
+                        
+                            
+                                
+Time
+                                
+Employee ID
+                                
+Name
+                                
+Department
+                                
+Type
+                                
+Verification
+                                
+Device
+                            
+                        
+                        
+                            
+Loading...
+                        
+                    
+                
+            
+            
+            
+                
+                    
+ User Management
+                    
+                        
+ Add User
+                    
+                
+                
+                    
+                        
+                            
+                                
+ID
+                                
+Name
+                                
+Employee ID
+                                
+Department
+                                
+Position
+                                
+Email
+                                
+Biometric
+                                
+Status
+                                
+Actions
+                            
+                        
+                        
+                            
+Loading...
+                        
+                    
+                
+            
+            
+            
+                
+                    
+ Monthly Attendance Report
+                    
+                        
+                        
+                        
+                            
+ Generate
+                        
+                    
+                
+                
+                    
+                        
+                            
+                                
+Employee ID
+                                
+Name
+                                
+Department
+                                
+Present
+                                
+Late
+                                
+Absent
+                                
+Early Leave
+                                
+Half Day
+                                
+On Leave
+                                
+Total Hours
+                            
+                        
+                        
+                            
+Select month/year and click Generate.
+                        
+                    
+                
+            
+            
+            
+                
+                    
+ Registered Devices
+                    
+                        
+ Add Device
+                    
+                
+                
+                    
+                        
+                            
+                                
+Serial #
+                                
+Model
+                                
+IP Address
+                                
+Port
+                                
+Location
+                                
+Status
+                                
+Last Synced
+                                
+Actions
+                            
+                        
+                        
+                            
+Loading...
+                        
+                    
+                
+            
+        
+    
+    
+    
+        
+            
+                
+                    
+Add User
+                    
+&times;
+                
+                
+                    
+                    
+                        
+Name *
+                        
+                    
+                    
+                        
+Employee ID *
+                        
+                    
+                    
+                        
+Email
+                        
+                    
+                    
+                        
+Phone
+                        
+                    
+                    
+                        
+                            
+Department
+                            
+                        
+                        
+                            
+Position
+                            
+                        
+                    
+                
+                
+                    
+Cancel
+                    
+Save
+                
+            
+        
+    
+    
+    
+        
+            
+                
+                    
+Register Device
+                    
+&times;
+                
+                
+                    
+                        
+Serial Number *
+                        
+                    
+                    
+                        
+Model
+                        
+                    
+                    
+                        
+IP Address *
+                        
+                    
+                    
+                        
+Port
+                        
+                    
+                    
+                        
+Location
+                        
+                    
+                
+                
+                    
+Cancel
+                    
+Save

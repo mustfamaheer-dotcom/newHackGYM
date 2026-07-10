@@ -1,0 +1,101 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Employee {
+  id              Int      @id @default(autoincrement())
+  name            String
+  employeeId      String   @unique
+  email           String?
+  phoneNumber     String?
+  department      String?
+  position        String?
+  biometricTemplate String?
+  profilePhoto    String?
+  status          Int      @default(1) // 1=Active, 2=Inactive, 3=Suspended, 4=Deleted
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  attendanceRecords    AttendanceRecord[]
+  attendanceSummaries  AttendanceSummary[]
+  accessLogs           AccessLog[]
+
+  @@map("Employees")
+}
+
+model Device {
+  id              Int      @id @default(autoincrement())
+  serialNumber    String   @unique
+  model           String   @default("MB2000")
+  firmwareVersion String   @default("1.0")
+  ipAddress       String
+  port            Int      @default(4370)
+  status          Int      @default(1) // 1=Online, 2=Offline, 3=Error, 4=Maintenance
+  lastSyncedDate  DateTime @default(now())
+  location        String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("Devices")
+}
+
+model AttendanceRecord {
+  id                  Int      @id @default(autoincrement())
+  userId              Int
+  timestamp           DateTime
+  status              Int      @default(0) // 0=CheckIn, 1=CheckOut
+  deviceSerialNumber  String?
+  verificationType    Int      @default(1) // 0=Fingerprint, 1=Face, 2=Card, 3=Password, 4=Multi
+  verificationScore   Int      @default(0)
+  notes               String?
+  isSynced            Boolean  @default(true)
+  syncedDate          DateTime @default(now())
+  createdAt           DateTime @default(now())
+
+  user                Employee @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, timestamp])
+  @@index([timestamp])
+  @@map("AttendanceRecords")
+}
+
+model AttendanceSummary {
+  id                Int      @id @default(autoincrement())
+  userId            Int
+  date              DateTime
+  checkInTime       DateTime?
+  checkOutTime      DateTime?
+  workDurationMinutes Int?
+  attendanceStatus  Int      @default(1) // 1=Present, 2=Absent, 3=Late, 4=EarlyLeave, 5=HalfDay, 6=OnLeave
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user              Employee @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([date])
+  @@map("AttendanceSummaries")
+}
+
+model AccessLog {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  timestamp   DateTime
+  status      Int      @default(1) // 1=Granted, 2=Denied
+  deviceId    String?
+  location    String?
+  reason      String?
+  description String?
+  createdAt   DateTime @default(now())
+
+  user        Employee @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, timestamp])
+  @@index([timestamp])
+  @@map("AccessLogs")
+}

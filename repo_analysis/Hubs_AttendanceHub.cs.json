@@ -1,0 +1,20 @@
+{
+  "code": 200,
+  "data": {
+    "description": "",
+    "html": "<html><head><meta name=\"color-scheme\" content=\"light dark\"></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\">using System;\nusing System.Threading.Tasks;\nusing Microsoft.AspNet.SignalR;\nusing Microsoft.AspNet.SignalR.Hubs;\n\nnamespace AttendanceSystem.Hubs\n{\n    /// <summary>\n    /// SignalR hub that pushes real-time attendance events to connected\n    /// dashboard clients. The Python device service POSTs records to the\n    /// /api/attendance/sync endpoint, which then broadcasts to all clients\n    /// subscribed to this hub.\n    ///\n    /// Client-side events (JavaScript):\n    ///   - attendanceRecorded  : fired on each individual check-in/out\n    ///   - recordsSynced       : fired when a batch sync completes\n    ///   - deviceStatusChanged : fired when device status updates\n    /// </summary>\n    public class AttendanceHub : Hub\n    {\n        private static int _connectedClients = 0;\n\n        public override Task OnConnected()\n        {\n            _connectedClients++;\n            Clients.All.clientCountChanged(_connectedClients);\n            return base.OnConnected();\n        }\n\n        public override Task OnDisconnected(bool stopCalled)\n        {\n            if (_connectedClients > 0) _connectedClients--;\n            Clients.All.clientCountChanged(_connectedClients);\n            return base.OnDisconnected(stopCalled);\n        }\n\n        /// <summary>\n        /// Allows clients to join a device-specific group so they only\n        /// receive events for a particular device serial number.\n        /// </summary>\n        [HubMethodName(\"SubscribeToDevice\")]\n        public Task SubscribeToDevice(string deviceSerial)\n        {\n            if (string.IsNullOrWhiteSpace(deviceSerial))\n                throw new ArgumentException(\"Device serial required\");\n            return Groups.Add(Context.ConnectionId, $\"device-{deviceSerial}\");\n        }\n\n        [HubMethodName(\"UnsubscribeFromDevice\")]\n        public Task UnsubscribeFromDevice(string deviceSerial)\n            => string.IsNullOrWhiteSpace(deviceSerial)\n                ? Task.CompletedTask\n                : Groups.Remove(Context.ConnectionId, $\"device-{deviceSerial}\");\n    }\n}\n</pre></body></html>",
+    "httpStatus": 200,
+    "httpStatusText": "",
+    "title": "",
+    "url": "https://raw.githubusercontent.com/mustfamaheer-dotcom/TestDevice/main/backend/AttendanceSystem/Hubs/AttendanceHub.cs",
+    "usage": {
+      "tokens": 427
+    }
+  },
+  "meta": {
+    "usage": {
+      "tokens": 427
+    }
+  },
+  "status": 20000
+}

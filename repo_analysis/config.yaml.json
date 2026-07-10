@@ -1,0 +1,20 @@
+{
+  "code": 200,
+  "data": {
+    "description": "",
+    "html": "<html><head><meta name=\"color-scheme\" content=\"light dark\"></head><body><pre style=\"word-wrap: break-word; white-space: pre-wrap;\"># ===========================================================================\n# ZKTeco Attendance Service — Configuration\n# ===========================================================================\n# Copy this file to config.yaml and edit values to match your environment.\n# Environment variables (ZK_DEVICE_IP, ZK_API_URL, ZK_API_KEY, ZK_POLL_INTERVAL)\n# override any value below.\n# ===========================================================================\n\n# --- Devices ---\n# List of ZKTeco devices to poll. Add more entries for multi-device setups.\n# NOTE: pyzk uses port 4370 by default (NOT 5200 as commonly documented).\ndevices:\n  - ip: 192.168.1.201\n    port: 4370\n    password: 0\n    timeout: 10\n    serial_number: \"ZKT001\"\n    location: \"Main Entrance\"\n    force_udp: false\n    ommit_ping: false\n  # - ip: 192.168.1.101\n  #   port: 4370\n  #   serial_number: \"ZKT002\"\n  #   location: \"Back Door\"\n\n# --- C# Backend ---\nbackend:\n  url: http://localhost:5000\n  sync_endpoint: /api/attendance/sync\n  timeout_seconds: 10\n  api_key: \"\"                              # set to match Web.config -> Security:ApiKey\n  retry_attempts: 3\n  retry_backoff_seconds: 5\n\n# --- Service behaviour ---\nservice:\n  poll_interval_seconds: 60                # how often to poll each device\n  queue_db_path: ./queue.sqlite            # persistent local queue (survives restart)\n  capture_images: false                    # enable to capture face snapshots (slow)\n  log_file: ./zkteco_service.log\n  log_level: INFO                          # DEBUG | INFO | WARNING | ERROR\n  log_max_bytes: 10485760                  # 10 MB\n  log_backup_count: 5\n  healthcheck_port: 8080                   # set to 0 to disable\n\n# --- User mapping ---\n# Map device-side user UID -> backend UserId. If a UID is not listed here,\n# the service assumes device UID == backend UserId (1:1).\nuser_map:\n  # 1: 101\n  # 2: 102\n  # 3: 103\n</pre></body></html>",
+    "httpStatus": 200,
+    "httpStatusText": "",
+    "title": "",
+    "url": "https://raw.githubusercontent.com/mustfamaheer-dotcom/TestDevice/main/python-service/config.yaml",
+    "usage": {
+      "tokens": 511
+    }
+  },
+  "meta": {
+    "usage": {
+      "tokens": 511
+    }
+  },
+  "status": 20000
+}

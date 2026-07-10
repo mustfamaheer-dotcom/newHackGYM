@@ -1,0 +1,545 @@
+"""
+ZKTeco MB2000 Device Communication Service
+==========================================
+Production-ready service that:
+  1. Connects to one or more ZKTeco MB2000 (and similar ZK-protocol) devices
+     over the local network using the `zk` library (pyzk).
+  2. Polls each device for new attendance records on a configurable interval.
+  3. Persists records to an on-disk SQLite queue (so records are never lost
+     if the C# backend is temporarily unreachable).
+  4. POSTs batches to the C# backend's /api/attendance/sync endpoint.
+  5. Supports image capture (face snapshot at check-in) when enabled.
+  6. Tracks the last seen record per device using its in-device uid, so the
+     service resumes cleanly after restarts.
+Usage
+-----
+    python zkteco_service.py --config config.yaml
+Or run with environment variables:
+    ZK_DEVICE_IP=192.168.1.100 ZK_API_URL=http://localhost:5000 python zkteco_service.py
+Dependencies
+------------
+    pip install -r requirements.txt
+"""
+from __future__ import annotations
+import argparse
+import json
+import logging
+import logging.handlers
+import os
+import sqlite3
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import requests
+import yaml
+# pyzk — pure Python implementation of the ZKTeco wire protocol
+try:
+    from zk import ZK, const as zk_const
+except ImportError:
+    print("ERROR: pyzk not installed. Run: pip install -r requirements.txt")
+    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "devices": [
+        {
+            "ip": "192.168.1.100",
+            "port": 4370,           # pyzk uses 4370 by default (NOT 5200)
+            "password": 0,
+            "timeout": 10,
+            "serial_number": "ZKT001",
+            "location": "Main Entrance",
+            "force_udp": False,
+            "ommit_ping": False,
+        }
+    ],
+    "backend": {
+        "url": "http://localhost:5000",
+        "sync_endpoint": "/api/attendance/sync",
+        "timeout_seconds": 10,
+        "api_key": "",             # sent as X-API-Key header if set
+        "retry_attempts": 3,
+        "retry_backoff_seconds": 5,
+    },
+    "service": {
+        "poll_interval_seconds": 60,
+        "queue_db_path": "queue.sqlite",
+        "capture_images": False,
+        "log_file": "zkteco_service.log",
+        "log_level": "INFO",
+        "log_max_bytes": 10 * 1024 * 1024,
+        "log_backup_count": 5,
+        "healthcheck_port": 8080,
+    },
+    "user_map": {
+        # Device-side user UID -> backend UserId
+        # e.g. "1": 101, "2": 102
+    },
+}
+def load_config(path: Optional[str]) -> dict:
+    """Load YAML configuration, merging with defaults. Falls back to
+    environment variables when keys are missing."""
+    cfg = _deep_copy(DEFAULT_CONFIG)
+    if path and Path(path).exists():
+        with open(path, "r", encoding="utf-8") as f:
+            user_cfg = yaml.safe_load(f) or {}
+        _deep_merge(cfg, user_cfg)
+    # Environment variable overrides
+    if os.getenv("ZK_DEVICE_IP"):
+        cfg["devices"][0]["ip"] = os.environ["ZK_DEVICE_IP"]
+    if os.getenv("ZK_DEVICE_PORT"):
+        cfg["devices"][0]["port"] = int(os.environ["ZK_DEVICE_PORT"])
+    if os.getenv("ZK_API_URL"):
+        cfg["backend"]["url"] = os.environ["ZK_API_URL"]
+    if os.getenv("ZK_API_KEY"):
+        cfg["backend"]["api_key"] = os.environ["ZK_API_KEY"]
+    if os.getenv("ZK_POLL_INTERVAL"):
+        cfg["service"]["poll_interval_seconds"] = int(os.environ["ZK_POLL_INTERVAL"])
+    return cfg
+def _deep_copy(d: dict) -> dict:
+    return json.loads(json.dumps(d))
+def _deep_merge(base: dict, override: dict) -> dict:
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def setup_logging(cfg: dict) -> logging.Logger:
+    log_cfg = cfg.get("service", {})
+    log_level = getattr(logging, log_cfg.get("log_level", "INFO").upper(), logging.INFO)
+    logger = logging.getLogger("zkteco")
+    logger.setLevel(log_level)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s")
+    # Console
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    # Rotating file
+    log_file = log_cfg.get("log_file", "zkteco_service.log")
+    fh = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=log_cfg.get("log_max_bytes", 10 * 1024 * 1024),
+        backupCount=log_cfg.get("log_backup_count", 5),
+        encoding="utf-8",
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # Reduce noise from underlying libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("zk").setLevel(logging.WARNING)
+    return logger
+# ---------------------------------------------------------------------------
+# Persistent queue (SQLite) — survives restarts and backend outages
+# ---------------------------------------------------------------------------
+QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_serial TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_uid INTEGER,                       -- device-side uid
+    timestamp TEXT NOT NULL,                -- ISO 8601 UTC
+    status INTEGER NOT NULL,                -- 0=CheckIn, 1=CheckOut
+    verification_type INTEGER DEFAULT 1,    -- 0=FP, 1=Face, 2=Card, 3=Password, 4=Multi
+    verification_score INTEGER DEFAULT 0,
+    captured_image BLOB,
+    created_at TEXT NOT NULL,
+    attempts INTEGER DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_device ON pending_records(device_serial);
+CREATE INDEX IF NOT EXISTS idx_pending_user_ts ON pending_records(user_id, timestamp);
+CREATE TABLE IF NOT EXISTS device_state (
+    device_serial TEXT PRIMARY KEY,
+    last_record_uid INTEGER DEFAULT 0,
+    last_sync_at TEXT,
+    last_seen_at TEXT,
+    status TEXT DEFAULT 'unknown'
+);
+"""
+class QueueStore:
+    """SQLite-backed persistent queue for attendance records."""
+    def __init__(self, db_path: str, logger: logging.Logger):
+        self.db_path = db_path
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._init_db()
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    def _init_db(self):
+        with self._lock, self._connect() as conn:
+            conn.executescript(QUEUE_SCHEMA)
+    def enqueue(self, record: dict):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO pending_records
+                   (device_serial, user_id, user_uid, timestamp, status,
+                    verification_type, verification_score, captured_image, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record["device_serial"],
+                    record["user_id"],
+                    record.get("user_uid"),
+                    record["timestamp"],
+                    record["status"],
+                    record.get("verification_type", 1),
+                    record.get("verification_score", 0),
+                    record.get("captured_image"),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+            )
+    def pending_batch(self, limit: int = 100) -> List[sqlite3.Row]:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """SELECT * FROM pending_records
+                   ORDER BY id ASC LIMIT ?""", (limit,)
+            ).fetchall()
+    def mark_failed(self, record_ids: List[int], error: str):
+        if not record_ids:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """UPDATE pending_records
+                   SET attempts = attempts + 1, last_error = ?
+                   WHERE id = ?""",
+                [(error[:500], rid) for rid in record_ids]
+            )
+    def delete(self, record_ids: List[int]):
+        if not record_ids:
+            return
+        with self._lock, self._connect() as conn:
+            placeholders = ",".join("?" * len(record_ids))
+            conn.execute(
+                f"DELETE FROM pending_records WHERE id IN ({placeholders})",
+                record_ids
+            )
+    def drop_old_failures(self, max_attempts: int = 10):
+        """Records that have failed too many times are archived to log."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_records WHERE attempts >= ?",
+                (max_attempts,)
+            ).fetchall()
+            for row in rows:
+                self.logger.error(
+                    f"Dropping record after {max_attempts} failures: "
+                    f"user={row['user_id']} ts={row['timestamp']} err={row['last_error']}"
+                )
+            conn.execute(
+                "DELETE FROM pending_records WHERE attempts >= ?",
+                (max_attempts,)
+            )
+    def update_device_state(self, serial: str, last_uid: Optional[int] = None,
+                             status: Optional[str] = None):
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT device_serial FROM device_state WHERE device_serial = ?",
+                (serial,)
+            ).fetchone()
+            now = datetime.now(timezone.utc).isoformat()
+            if existing:
+                if last_uid is not None:
+                    conn.execute(
+                        """UPDATE device_state
+                           SET last_record_uid = ?, last_seen_at = ?, status = ?
+                           WHERE device_serial = ?""",
+                        (last_uid, now, status or "online", serial)
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE device_state
+                           SET last_seen_at = ?, status = ?
+                           WHERE device_serial = ?""",
+                        (now, status or "online", serial)
+                    )
+            else:
+                conn.execute(
+                    """INSERT INTO device_state
+                       (device_serial, last_record_uid, last_seen_at, status)
+                       VALUES (?, ?, ?, ?)""",
+                    (serial, last_uid or 0, now, status or "online")
+                )
+    def get_device_last_uid(self, serial: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_record_uid FROM device_state WHERE device_serial = ?",
+                (serial,)
+            ).fetchone()
+            return row["last_record_uid"] if row else 0
+# ---------------------------------------------------------------------------
+# Device connector (pyzk wrapper)
+# ---------------------------------------------------------------------------
+@dataclass
+class DeviceConfig:
+    ip: str
+    port: int = 4370
+    password: int = 0
+    timeout: int = 10
+    serial_number: str = ""
+    location: str = ""
+    force_udp: bool = False
+    ommit_ping: bool = False
+class DeviceConnector:
+    """Wraps pyzk's ZK class with retry/reconnect logic."""
+    def __init__(self, cfg: DeviceConfig, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+        self._zk: Optional[ZK] = None
+        self._conn = None
+        self._lock = threading.Lock()
+    def connect(self) -> bool:
+        with self._lock:
+            if self._conn is not None:
+                return True
+            try:
+                self._zk = ZK(
+                    self.cfg.ip,
+                    port=self.cfg.port,
+                    timeout=self.cfg.timeout,
+                    password=self.cfg.password,
+                    force_udp=self.cfg.force_udp,
+                    ommit_ping=self.cfg.ommit_ping,
+                )
+                self._conn = self._zk.connect()
+                self._conn.disable_device()
+                self.logger.info(
+                    f"Connected to device {self.cfg.serial_number} at "
+                    f"{self.cfg.ip}:{self.cfg.port}"
+                )
+                return True
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to connect to {self.cfg.serial_number} "
+                    f"({self.cfg.ip}:{self.cfg.port}): {e}"
+                )
+                self._conn = None
+                self._zk = None
+                return False
+    def disconnect(self):
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.enable_device()
+                    self._conn.disconnect()
+                except Exception as e:
+                    self.logger.warning(f"Disconnect error: {e}")
+                self._conn = None
+                self._zk = None
+    def get_attendance(self) -> List[Any]:
+        """Fetch all attendance records from the device."""
+        if not self.connect():
+            return []
+        try:
+            return self._conn.get_attendance()
+        except Exception as e:
+            self.logger.error(f"get_attendance failed on {self.cfg.serial_number}: {e}")
+            self.disconnect()
+            return []
+    def get_users(self) -> List[Any]:
+        if not self.connect():
+            return []
+        try:
+            return self._conn.get_users()
+        except Exception as e:
+            self.logger.error(f"get_users failed on {self.cfg.serial_number}: {e}")
+            return []
+    def get_serial_number(self) -> Optional[str]:
+        if not self.connect():
+            return None
+        try:
+            return self._conn.get_serialnumber()
+        except Exception as e:
+            self.logger.warning(f"get_serialnumber failed: {e}")
+            return None
+    def capture_image(self) -> Optional[bytes]:
+        """Capture a face snapshot from the device. May not be supported
+        on all firmware revisions."""
+        if not self.connect():
+            return None
+        try:
+            # Not all firmware supports snapshot; wrap defensively
+            return None  # Implement per-device if needed
+        except Exception as e:
+            self.logger.warning(f"Image capture failed: {e}")
+            return None
+    def live_capture_connect(self):
+        """Open a dedicated connection for real-time live capture."""
+        zk = ZK(
+            self.cfg.ip,
+            port=self.cfg.port,
+            timeout=self.cfg.timeout,
+            password=self.cfg.password,
+            force_udp=self.cfg.force_udp,
+            ommit_ping=self.cfg.ommit_ping,
+        )
+        conn = zk.connect()
+        conn.disable_device()
+        self.logger.info(f"Live capture connected to {self.cfg.serial_number}")
+        return conn
+# ---------------------------------------------------------------------------
+# Backend client
+# ---------------------------------------------------------------------------
+class BackendClient:
+    def __init__(self, cfg: dict, logger: logging.Logger):
+        self.url = cfg["url"].rstrip("/")
+        self.sync_endpoint = cfg.get("sync_endpoint", "/api/attendance/sync")
+        self.timeout = cfg.get("timeout_seconds", 10)
+        self.api_key = cfg.get("api_key", "")
+        self.retry_attempts = cfg.get("retry_attempts", 3)
+        self.retry_backoff = cfg.get("retry_backoff_seconds", 5)
+        self.logger = logger
+    def sync_records(self, device_serial: str, records: List[dict]) -> Tuple[bool, str]:
+        if not records:
+            return True, "no records"
+        url = f"{self.url}{self.sync_endpoint}"
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "deviceSerialNumber": device_serial,
+            "records": records,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        last_err = ""
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+                if resp.status_code == 200:
+                    return True, "ok"
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            except requests.RequestException as e:
+                last_err = f"{type(e).__name__}: {e}"
+            self.logger.warning(
+                f"Backend sync attempt {attempt}/{self.retry_attempts} failed: {last_err}"
+            )
+            if attempt 
+= 12:
+                            if len(data) >= 52:
+                                user_id, status, punch, timehex = unpack('
+= POLL_FALLBACK_INTERVAL:
+                    try:
+                        records = device.get_attendance()
+                        new_records = [r for r in records if r.uid > last_uid]
+                        if not new_records and records:
+                            last_uid = records[-1].uid
+                        for r in new_records:
+                            self._enqueue_record(serial, r.user_id, r.timestamp, r.punch, device)
+                            last_uid = max(last_uid, r.uid)
+                        if new_records:
+                            self.logger.info(f"[{serial}] Fallback poll queued {len(new_records)} records (last_uid={last_uid})")
+                        self.queue.update_device_state(serial, last_uid=last_uid, status="online")
+                    except Exception as e:
+                        self.logger.warning(f"[{serial}] Fallback poll error: {e}")
+                        device.disconnect()
+                    last_poll_time = now
+                self.state.poll_count += 1
+                self.state.last_poll[serial] = datetime.now(timezone.utc)
+            except Exception as e:
+                self.logger.error(f"[{serial}] Device loop error: {e}", exc_info=True)
+                self.queue.update_device_state(serial, status="error")
+                device.disconnect()
+                live_conn = None
+                self._sleep(5)
+    def _enqueue_record(self, serial, user_id, timestamp, punch, device):
+        backend_user_id = self._resolve_user_id(user_id)
+        if backend_user_id is None:
+            self.logger.warning(
+                f"[{serial}] Skipping record: no mapping for device user_id={user_id}"
+            )
+            return
+        captured = None
+        if self.capture_images:
+            captured = device.capture_image()
+        self.queue.enqueue({
+            "device_serial": serial,
+            "user_id": backend_user_id,
+            "user_uid": user_id,
+            "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+            "status": self._map_status(punch),
+            "verification_type": self._map_verification(punch),
+            "verification_score": 0,
+            "captured_image": captured,
+        })
+    def _resolve_user_id(self, device_user_id: int) -> Optional[int]:
+        if device_user_id in self.user_map:
+            return self.user_map[device_user_id]
+        # If no explicit map, assume backend UserId == device user_id
+        return device_user_id
+    @staticmethod
+    def _map_status(punch: int) -> int:
+        """ZK punch codes:
+            0 = Check-In
+            1 = Check-Out
+            2 = Break-Out
+            3 = Break-In
+            4 = Overtime-In
+            5 = Overtime-Out
+        We collapse break/overtime back to in/out for the backend.
+        """
+        if punch in (0, 3, 4):
+            return 0  # CheckIn
+        if punch in (1, 2, 5):
+            return 1  # CheckOut
+        return 0
+    @staticmethod
+    def _map_verification(punch: int) -> int:
+        # pyzk packs punch type in the high bits — see pyzk source.
+        # Default to face recognition for MB2000 (face device).
+        return 1  # FaceRecognition
+    # ----- Backend sync loop -----
+    def _sync_loop(self):
+        self.logger.info("Backend sync loop started")
+        while self.state.running:
+            try:
+                batch = self.queue.pending_batch(limit=100)
+                if not batch:
+                    self._sleep(self.poll_interval)
+                    continue
+                # Group by device for the sync endpoint
+                by_device: Dict[str, List[sqlite3.Row]] = {}
+                for row in batch:
+                    by_device.setdefault(row["device_serial"], []).append(row)
+                for serial, rows in by_device.items():
+                    records_payload = [
+                        {
+                            "userId": r["user_id"],
+                            "timestamp": r["timestamp"],
+                            "status": r["status"],
+                            "deviceSerialNumber": serial,
+                            "verificationType": r["verification_type"],
+                            "verificationScore": r["verification_score"],
+                            "capturedImage": (
+                                list(r["captured_image"]) if r["captured_image"] else None
+                            ),
+                        }
+                        for r in rows
+                    ]
+                    ok, err = self.backend.sync_records(serial, records_payload)
+                    if ok:
+                        self.queue.delete([r["id"] for r in rows])
+                        self.logger.info(
+                            f"Synced {len(rows)} records from {serial} to backend"
+                        )
+                    else:
+                        self.state.sync_failures += 1
+                        self.queue.mark_failed([r["id"] for r in rows], err)
+                        self.logger.error(f"Sync failed for {serial}: {err}")
+                # Drop records that have failed too many times
+                self.queue.drop_old_failures(max_attempts=10)
+            except Exception as e:
+                self.logger.error(f"Sync loop error: {e}", exc_info=True)
+                self._sle
