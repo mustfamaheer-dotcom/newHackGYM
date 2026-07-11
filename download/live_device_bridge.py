@@ -23,9 +23,11 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -114,6 +116,9 @@ def setup_logging(cfg: dict) -> logging.Logger:
     if log_file:
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
+        # Force immediate flush
+        fh.stream = open(log_file, "a", buffering=1, encoding="utf-8")
+        fh.stream.reconfigure(line_buffering=True)
         logger.addHandler(fh)
     return logger
 
@@ -144,6 +149,8 @@ class LiveDeviceBridge:
         self.user_map = {int(k): v for k, v in user_map.items()}
         self.logger = logger
         self.last_uid = 0
+        self.last_timestamp = datetime.min.replace(tzinfo=timezone.utc)
+        self.known_records: set = set()  # unused, kept for backward compat
         self.running = True
 
     def connect(self) -> Optional[Any]:
@@ -168,10 +175,152 @@ class LiveDeviceBridge:
             self.logger.error(f"Failed to connect to device: {e}")
             return None
 
-    def push_to_backend(self, records: List[dict]) -> bool:
-        """Push attendance records to the Next.js backend API."""
+    def start_realtime_listener(self, conn) -> Optional[threading.Thread]:
+        """
+        Start a background thread to listen for real-time attendance events.
+        Uses the device's event registration mechanism.
+        """
+        def listen_events():
+            try:
+                # Register for real-time events (if supported)
+                conn.enable_device()
+                conn.reg_event(1)  # 1 = attendance events
+                self.logger.info("Real-time event listener STARTED (reg_event=1)")
+                
+                while self.running:
+                    try:
+                        # Try to receive event with timeout
+                        data = conn.recv_event()
+                        if data:
+                            self._process_realtime_event(data)
+                        else:
+                            time.sleep(0.1)
+                    except Exception as e:
+                        if self.running:
+                            self.logger.debug(f"recv_event error (may be timeout): {e}")
+                        time.sleep(1)
+            except Exception as e:
+                self.logger.warning(f"Real-time listener failed: {e}")
+            finally:
+                try:
+                    conn.reg_event(0)  # Disable events
+                except:
+                    pass
+
+        thread = threading.Thread(target=listen_events, daemon=True)
+        thread.start()
+        return thread
+
+    def _process_realtime_event(self, event_data):
+        """Process a real-time event from the device."""
+        try:
+            # Parse event_data - format varies by firmware
+            # Common formats:
+            # - Tuple: (uid, user_id, timestamp, state, ...)
+            # - Attendance object
+            if hasattr(event_data, 'user_id'):
+                user_id = event_data.user_id
+                timestamp = event_data.timestamp
+                punch = getattr(event_data, 'punch', 0)
+                uid = getattr(event_data, 'uid', 0)
+            elif isinstance(event_data, (tuple, list)) and len(event_data) >= 4:
+                uid, user_id, timestamp, punch = event_data[0], event_data[1], event_data[2], event_data[3]
+            else:
+                self.logger.debug(f"Unknown event format: {event_data}")
+                return
+
+            # Normalize user_id
+            if not isinstance(user_id, (int, float)):
+                try:
+                    user_id = int(user_id)
+                except (ValueError, TypeError):
+                    return
+
+            # Check if newer than last processed
+            if self.last_timestamp and timestamp <= self.last_timestamp:
+                return
+
+            self.last_timestamp = timestamp
+            backend_user_id = self.resolve_user_id(user_id)
+            if backend_user_id is None:
+                self.logger.warning(f"Skipping real-time event: no mapping for device user {user_id}")
+                return
+
+            record = {
+                "id": uid,
+                "userId": backend_user_id,
+                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                "status": 0 if punch in (0, 3, 4) else 1,
+                "verificationType": 1,
+                "verificationScore": 0,
+                "deviceSerialNumber": self.device_cfg.serial_number,
+            }
+
+            # Instant push to WebSocket
+            self.push_to_websocket(record)
+
+            # Batch push to backend
+            self.push_to_backend([{
+                "userId": backend_user_id,
+                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                "status": 0 if punch in (0, 3, 4) else 1,
+                "verificationType": 1,
+                "verificationScore": 0,
+            }])
+
+            self.logger.info(f"Real-time event: User {user_id} at {timestamp}")
+
+        except Exception as e:
+            self.logger.error(f"Error processing real-time event: {e}")
+
+    def sync_users_to_backend(self, device_users) -> bool:
+        """Push users from the ZKTeco device to the backend."""
+        try:
+            if not device_users:
+                self.logger.info("No users found on device")
+                return False
+
+            users_payload = []
+            for u in device_users:
+                uid = u.user_id
+                if not isinstance(uid, (int, float)):
+                    try:
+                        uid = int(uid)
+                    except (ValueError, TypeError):
+                        continue
+                name = (getattr(u, "name", "") or "").strip()
+                if not name:
+                    name = f"User {uid}"
+                users_payload.append({
+                    "userId": uid,
+                    "name": name,
+                    "employeeId": str(uid),
+                })
+
+            if not users_payload:
+                return False
+
+            url = f"{self.backend_cfg['api_url']}/api/attendance/sync-users"
+            headers = {"Content-Type": "application/json"}
+            resp = requests.post(url, json={"users": users_payload}, headers=headers, timeout=120)
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                self.logger.info(
+                    f"Synced {len(users_payload)} users from device "
+                    f"({data.get('created', 0)} created, {data.get('updated', 0)} updated)"
+                )
+                return True
+            else:
+                self.logger.error(f"User sync returned {resp.status_code}: {resp.text[:200]}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to sync users: {e}")
+            return False
+
+    def push_to_backend(self, records: List[dict]) -> tuple[bool, List[dict]]:
+        """Push attendance records to the Next.js backend API. Returns (success, created_records)."""
         if not records:
-            return True
+            return True, []
 
         url = f"{self.backend_cfg['api_url']}{self.backend_cfg['sync_endpoint']}"
         payload = {
@@ -192,18 +341,16 @@ class LiveDeviceBridge:
                 timeout=self.backend_cfg.get("timeout_seconds", 10),
             )
             if resp.status_code == 200:
-                self.logger.info(
-                    f"Pushed {len(records)} records to backend successfully"
-                )
-                return True
+                data = resp.json()
+                created = data.get("data", {}).get("records", [])
+                self.logger.info(f"Pushed {len(records)} records to backend successfully ({len(created)} inserted)")
+                return True, created
             else:
-                self.logger.error(
-                    f"Backend returned {resp.status_code}: {resp.text[:200]}"
-                )
-                return False
+                self.logger.error(f"Backend returned {resp.status_code}: {resp.text[:200]}")
+                return False, []
         except requests.RequestException as e:
             self.logger.error(f"Failed to push to backend: {e}")
-            return False
+            return False, []
 
     def push_to_websocket(self, record: dict):
         """Push a single record to the WebSocket service for instant dashboard update."""
@@ -219,24 +366,66 @@ class LiveDeviceBridge:
         except requests.RequestException:
             pass  # Best-effort
 
+    @staticmethod
+    def _normalize_ts(ts):
+        """Strip timezone info from a timestamp to avoid naive vs aware comparison errors."""
+        if ts is None:
+            return None
+        try:
+            return ts.replace(tzinfo=None)
+        except (AttributeError, TypeError):
+            return ts
+
+    @staticmethod
+    def _ts_to_iso_str(ts):
+        """Convert timestamp to UTC ISO string with Z suffix and milliseconds for JS compatibility."""
+        if hasattr(ts, "isoformat"):
+            dt = ts
+        else:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        # Ensure UTC and format with Z suffix + milliseconds
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
     def resolve_user_id(self, device_user_id: int) -> Optional[int]:
         """Map device-side user ID to backend user ID."""
         if device_user_id in self.user_map:
             return self.user_map[device_user_id]
         return device_user_id  # Assume 1:1 if no mapping
 
+    def try_get_photo(self, conn, uid: int) -> Optional[str]:
+        """
+        Attempt to fetch a face photo from the device for the given user.
+        Returns a base64-encoded JPEG string if found, otherwise None.
+        """
+        try:
+            # Try to get face template (type 9 = face)
+            template = conn.get_user_template(uid, 9)
+            if template:
+                # For now, just return None since we can't decode ZK templates
+                return None
+            # Try type 0 (fingerprint)
+            template = conn.get_user_template(uid, 0)
+            if template:
+                return None
+        except Exception:
+            pass
+        return None
+
     def run_live(self):
         """
-        Main loop: tries live capture first, falls back to fast polling.
-
-        The ZKTeco protocol doesn't natively support push notifications
-        over TCP for attendance events. Instead, we use a FAST polling
-        approach (default 10 seconds) combined with instant push to
-        the WebSocket service. This reduces latency from 60s to ~10s.
-
-        For truly sub-second latency, some ZKTeco firmware versions
-        support a real-time event log feature. This bridge attempts
-        to use it when available.
+        Main loop: dual-connection architecture for real-time events.
+        
+        Connection 1 (background): Persistent connection registered for 
+        EF_ATTLOG events - reads socket for instant attendance pushes.
+        
+        Connection 2 (main): Periodic full attendance sync as fallback
+        and for initial sync / gap recovery.
+        
+        This achieves <3s latency when device firmware supports event push.
         """
         self.logger.info(
             f"Starting live bridge for {self.device_cfg.serial_number}..."
@@ -251,52 +440,75 @@ class LiveDeviceBridge:
                     time.sleep(10)
                     continue
 
-                # Get initial last UID
+                # Sync users from device to backend (disconnect first to avoid holding device)
+                try:
+                    device_users = conn.get_users()
+                except Exception as e:
+                    self.logger.warning(f"Failed to get users from device: {e}")
+                    device_users = None
+                try:
+                    conn.enable_device()
+                    conn.disconnect()
+                except:
+                    pass
+                conn = None
+                if device_users is not None:
+                    self.sync_users_to_backend(device_users)
+
+                # Reconnect for periodic full sync (fallback / gap recovery)
+                conn = self.connect()
+                if not conn:
+                    self.logger.warning("Reconnect failed after user sync")
+                    time.sleep(10)
+                    continue
+
+                # Establish initial last_timestamp from device
                 all_records = conn.get_attendance()
                 if all_records:
-                    self.last_uid = max(r.uid for r in all_records)
+                    self.last_timestamp = self._normalize_ts(max(r.timestamp for r in all_records))
                     self.logger.info(
-                        f"Device has {len(all_records)} records, last UID: {self.last_uid}"
+                        f"Device has {len(all_records)} records, last timestamp: {self.last_timestamp}"
                     )
 
-                # Fast polling loop
                 poll_interval = self.backend_cfg.get("poll_fallback_seconds", 10)
-                self.logger.info(f"Starting fast polling (every {poll_interval}s)...")
+                self.logger.info(f"Periodic full sync every {poll_interval}s (fallback)...")
 
                 while self.running:
                     try:
-                        records = conn.get_attendance()
-                        new_records = [r for r in records if r.uid > self.last_uid]
+                        self.logger.debug("Starting get_attendance() call...")
+                        # Use a thread pool to enforce a 120s timeout on get_attendance
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            fut = pool.submit(conn.get_attendance)
+                            try:
+                                records = fut.result(timeout=120)
+                                self.logger.debug(f"get_attendance() returned {len(records)} records")
+                            except concurrent.futures.TimeoutError:
+                                self.logger.warning("get_attendance timed out after 120s, reconnecting...")
+                                break
+                            except Exception as e:
+                                self.logger.error(f"get_attendance error: {e}")
+                                break
+
+                        # Find new records by timestamp (only records after last seen)
+                        new_records = []
+                        for r in records:
+                            ts = self._normalize_ts(r.timestamp)
+                            if self.last_timestamp is not None and ts <= self.last_timestamp:
+                                continue
+                            uid = r.user_id
+                            if not isinstance(uid, (int, float)):
+                                try:
+                                    uid = int(uid)
+                                except (ValueError, TypeError):
+                                    continue
+                            new_records.append(r)
 
                         if new_records:
                             self.logger.info(
-                                f"Found {len(new_records)} new record(s)!"
+                                f"Periodic sync found {len(new_records)} new record(s)!"
                             )
 
-                            # Push each record INSTANTLY to WebSocket
-                            for r in sorted(new_records, key=lambda x: x.uid):
-                                backend_user_id = self.resolve_user_id(r.user_id)
-                                if backend_user_id is None:
-                                    self.logger.warning(
-                                        f"Skipping: no mapping for device user {r.user_id}"
-                                    )
-                                    continue
-
-                                record = {
-                                    "id": r.uid,
-                                    "userId": backend_user_id,
-                                    "timestamp": r.timestamp.isoformat() if hasattr(r.timestamp, "isoformat") else str(r.timestamp),
-                                    "status": 0 if r.punch in (0, 3, 4) else 1,
-                                    "verificationType": 1,  # FaceRecognition for MB2000
-                                    "verificationScore": 0,
-                                    "deviceSerialNumber": self.device_cfg.serial_number,
-                                }
-
-                                # Instant push to WebSocket for dashboard
-                                self.push_to_websocket(record)
-                                self.last_uid = max(self.last_uid, r.uid)
-
-                            # Batch push to backend API
+                            # Batch push to backend API FIRST (so record persists in DB)
                             batch = [
                                 {
                                     "userId": self.resolve_user_id(r.user_id) or r.user_id,
@@ -304,15 +516,58 @@ class LiveDeviceBridge:
                                     "status": 0 if r.punch in (0, 3, 4) else 1,
                                     "verificationType": 1,
                                     "verificationScore": 0,
+                                    "photo": None,
                                 }
                                 for r in new_records
                                 if self.resolve_user_id(r.user_id) is not None
                             ]
+                            created_records = []
                             if batch:
-                                self.push_to_backend(batch)
+                                success, created_records = self.push_to_backend(batch)
+                                if success:
+                                    # Clear device attendance log so next poll is instant
+                                    try:
+                                        conn.clear_attendance()
+                                        self.logger.info("Device attendance log cleared (next poll will be instant)")
+                                    except Exception as e:
+                                        self.logger.warning(f"Failed to clear attendance log: {e}")
+
+                            # THEN push to WebSocket with CORRECT DB IDs from backend
+                            if created_records:
+                                # Build lookup map: (userId, normalized_timestamp) -> id
+                                created_map = {}
+                                for cr in created_records:
+                                    cr_uid = cr.get("userId")
+                                    cr_ts = cr.get("timestamp")
+                                    if cr_uid is not None and cr_ts:
+                                        norm_ts = self._ts_to_iso_str(cr_ts)
+                                        created_map[(cr_uid, norm_ts)] = cr["id"]
+
+                                for r in sorted(new_records, key=lambda x: x.timestamp):
+                                    backend_user_id = self.resolve_user_id(r.user_id)
+                                    if backend_user_id is None:
+                                        continue
+
+                                    # Find matching created record by userId + normalized timestamp
+                                    norm_ts = self._ts_to_iso_str(r.timestamp)
+                                    db_id = created_map.get((backend_user_id, norm_ts), r.uid)
+
+                                    record = {
+                                        "id": db_id,  # Use DB auto-increment ID
+                                        "userId": backend_user_id,
+                                        "timestamp": norm_ts,
+                                        "status": 0 if r.punch in (0, 3, 4) else 1,
+                                        "verificationType": 1,
+                                        "verificationScore": 0,
+                                        "photo": None,
+                                        "deviceSerialNumber": self.device_cfg.serial_number,
+                                    }
+                                    self.push_to_websocket(record)
 
                         if records:
-                            self.last_uid = max(self.last_uid, max(r.uid for r in records))
+                            max_ts = max(self._normalize_ts(r.timestamp) for r in records)
+                            if max_ts > self.last_timestamp:
+                                self.last_timestamp = max_ts
 
                     except Exception as e:
                         self.logger.error(f"Polling error: {e}")

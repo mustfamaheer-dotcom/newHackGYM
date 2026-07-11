@@ -6,7 +6,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { userId, status, verificationType, verificationScore, deviceSerialNumber } = body as {
-      userId: number;
+      userId: number | string;
       status?: string;
       verificationType?: number;
       verificationScore?: number;
@@ -20,7 +20,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const user = await db.employee.findUnique({ where: { id: userId } });
+    const userIdNum = Number(userId);
+    if (!Number.isFinite(userIdNum)) {
+      return NextResponse.json(
+        { success: false, message: "Invalid userId" },
+        { status: 400 }
+      );
+    }
+
+    const user = await db.employee.findUnique({ where: { id: userIdNum } });
     if (!user) {
       return NextResponse.json(
         { success: false, message: "User not found" },
@@ -33,7 +41,7 @@ export async function POST(request: NextRequest) {
 
     const record = await db.attendanceRecord.create({
       data: {
-        userId,
+        userId: userIdNum,
         timestamp: now,
         status: checkInStatus,
         deviceSerialNumber: deviceSerialNumber || "MANUAL",
@@ -50,7 +58,7 @@ export async function POST(request: NextRequest) {
     nextDay.setDate(nextDay.getDate() + 1);
 
     const allDayRecords = await db.attendanceRecord.findMany({
-      where: { userId, timestamp: { gte: dateOnly, lt: nextDay } },
+      where: { userId: userIdNum, timestamp: { gte: dateOnly, lt: nextDay } },
       orderBy: { timestamp: "asc" },
     });
 

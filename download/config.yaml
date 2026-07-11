@@ -1,0 +1,23 @@
+devices:
+  - ip: 192.168.1.201
+    port: 4370
+    password: 0
+    timeout: 15
+    serial_number: ZKT001
+    force_udp: false
+    ommit_ping: false
+
+backend:
+  api_url: "http://localhost:3000"
+  sync_endpoint: "/api/attendance/sync"
+  ws_push_url: "http://localhost:3004/push-event"
+  timeout_seconds: 10
+  api_key: ""
+
+bridge:
+  poll_fallback_seconds: 10
+  log_level: INFO
+  log_file: C:\Users\Moustafa Maher\Desktop\bridge_logs\live_bridge.log
+  healthcheck_port: 8081
+
+user_map: {}

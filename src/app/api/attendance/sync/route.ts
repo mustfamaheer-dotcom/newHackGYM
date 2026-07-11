@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { Prisma } from "@prisma/client";
 
-// POST /api/attendance/sync — called by the Python ZKTeco device bridge
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -14,6 +12,7 @@ export async function POST(request: NextRequest) {
         status: number;
         verificationType?: number;
         verificationScore?: number;
+        photo?: string;
         deviceSerialNumber?: string;
       }>;
     };
@@ -27,49 +26,100 @@ export async function POST(request: NextRequest) {
 
     let inserted = 0;
     let skipped = 0;
+    const userIdsToEnsure = new Set<number>();
 
-    for (const r of records) {
-      const userId = r.userId;
+    const validRecords = records.filter((r) => {
+      const userId = Number(r.userId);
+      if (!Number.isFinite(userId)) { skipped++; return false; }
+      userIdsToEnsure.add(userId);
+      return true;
+    });
+
+    // Bulk ensure all employees exist
+    if (userIdsToEnsure.size > 0) {
+      const ids = Array.from(userIdsToEnsure);
+      const existing = await db.employee.findMany({
+        where: { id: { in: ids } },
+        select: { id: true },
+      });
+      const existingIds = new Set(existing.map((e) => e.id));
+      const missing = ids.filter((id) => !existingIds.has(id));
+
+      if (missing.length > 0) {
+        await db.employee.createMany({
+          data: missing.map((id) => ({
+            id,
+            name: `Employee #${id}`,
+            employeeId: `UID-${String(id).padStart(3, "0")}`,
+            status: 1,
+          })),
+          skipDuplicates: true,
+        });
+      }
+    }
+
+    // Batch dedup check: get all existing records for these users/timestamps
+    const timestamps = validRecords.map((r) => new Date(r.timestamp));
+    const uniqueUserIds = [...new Set(validRecords.map((r) => Number(r.userId)))];
+    const serial = deviceSerialNumber || validRecords[0]?.deviceSerialNumber;
+
+    const existingRecords = await db.attendanceRecord.findMany({
+      where: {
+        userId: { in: uniqueUserIds },
+        timestamp: { in: timestamps },
+        deviceSerialNumber: serial || undefined,
+      },
+      select: { userId: true, timestamp: true },
+    });
+    const existingSet = new Set(
+      existingRecords.map((r) => `${r.userId}-${r.timestamp.getTime()}`)
+    );
+
+    // Create new records in batch
+    const newRecords: Array<{
+      userId: number;
+      timestamp: Date;
+      status: number;
+      deviceSerialNumber: string | undefined;
+      verificationType: number;
+      verificationScore: number;
+      photo: string | null;
+      isSynced: boolean;
+      syncedDate: Date;
+    }> = [];
+
+    for (const r of validRecords) {
+      const userId = Number(r.userId);
       const timestamp = new Date(r.timestamp);
-      const serial = r.deviceSerialNumber || deviceSerialNumber;
+      const key = `${userId}-${timestamp.getTime()}`;
 
-      // Check user exists
-      const user = await db.employee.findUnique({ where: { id: userId } });
-      if (!user) {
+      if (existingSet.has(key)) {
         skipped++;
         continue;
       }
 
-      // De-duplicate: check if this exact record already exists
-      const existing = await db.attendanceRecord.findFirst({
-        where: {
-          userId,
-          timestamp,
-          deviceSerialNumber: serial,
-        },
+      newRecords.push({
+        userId,
+        timestamp,
+        status: r.status ?? 0,
+        deviceSerialNumber: serial,
+        verificationType: r.verificationType ?? 1,
+        verificationScore: r.verificationScore ?? 0,
+        photo: r.photo ?? null,
+        isSynced: true,
+        syncedDate: new Date(),
       });
-      if (existing) {
-        skipped++;
-        continue;
-      }
+      existingSet.add(key);
+    }
 
-      // Create attendance record
-      await db.attendanceRecord.create({
-        data: {
-          userId,
-          timestamp,
-          status: r.status ?? 0,
-          deviceSerialNumber: serial,
-          verificationType: r.verificationType ?? 1,
-          verificationScore: r.verificationScore ?? 0,
-          isSynced: true,
-          syncedDate: new Date(),
-        },
+    let created: Array<{ id: number; userId: number; timestamp: Date }> = [];
+
+    if (newRecords.length > 0) {
+      created = await db.attendanceRecord.createManyAndReturn({
+        data: newRecords,
+        select: { id: true, userId: true, timestamp: true },
       });
-      inserted++;
-
-      // Update daily summary
-      await updateDailySummary(userId, timestamp);
+      inserted = created.length;
     }
 
     // Update device last sync time
@@ -83,7 +133,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       message: `Synced ${inserted} new records (${skipped} duplicates skipped)`,
-      data: { inserted, skipped, total: inserted + skipped, deviceSerialNumber },
+      data: { inserted, skipped, total: inserted + skipped, deviceSerialNumber, records: created || [] },
     });
   } catch (error) {
     console.error("Sync failed:", error);
@@ -92,74 +142,4 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-async function updateDailySummary(userId: number, timestamp: Date) {
-  const dateOnly = new Date(timestamp.getFullYear(), timestamp.getMonth(), timestamp.getDate());
-  const nextDay = new Date(dateOnly);
-  nextDay.setDate(nextDay.getDate() + 1);
-
-  const records = await db.attendanceRecord.findMany({
-    where: {
-      userId,
-      timestamp: { gte: dateOnly, lt: nextDay },
-    },
-    orderBy: { timestamp: "asc" },
-  });
-
-  if (records.length === 0) return;
-
-  const checkInRecord = records.find((r) => r.status === 0);
-  const checkOutRecord = [...records].reverse().find((r) => r.status === 1);
-
-  const checkInTime = checkInRecord?.timestamp;
-  const checkOutTime = checkOutRecord?.timestamp;
-
-  // Late threshold: 9:15 AM
-  const lateThreshold = new Date(dateOnly);
-  lateThreshold.setHours(9, 15, 0, 0);
-
-  // Early leave threshold: 5:00 PM
-  const earlyLeaveThreshold = new Date(dateOnly);
-  earlyLeaveThreshold.setHours(17, 0, 0, 0);
-
-  let attendanceStatus = 1; // Present
-  if (checkInTime && checkInTime > lateThreshold) {
-    attendanceStatus = 3; // Late
-  }
-  if (checkOutTime && checkOutTime < earlyLeaveThreshold && checkInTime) {
-    attendanceStatus = 4; // EarlyLeave
-  }
-
-  let workDurationMinutes: number | null = null;
-  if (checkInTime && checkOutTime) {
-    workDurationMinutes = Math.round(
-      (checkOutTime.getTime() - checkInTime.getTime()) / 60000
-    );
-  }
-
-  // Upsert the daily summary
-  await db.attendanceSummary.upsert({
-    where: {
-      userId_date: {
-        userId,
-        date: dateOnly,
-      },
-    },
-    create: {
-      userId,
-      date: dateOnly,
-      checkInTime,
-      checkOutTime,
-      workDurationMinutes,
-      attendanceStatus,
-    },
-    update: {
-      checkInTime,
-      checkOutTime,
-      workDurationMinutes,
-      attendanceStatus,
-      updatedAt: new Date(),
-    },
-  });
 }

@@ -1,0 +1,1 @@
+SELECT id, "userId", timestamp, status, "deviceSerialNumber" FROM "AttendanceRecords" ORDER BY timestamp DESC LIMIT 10;

@@ -51,6 +51,7 @@ model AttendanceRecord {
   deviceSerialNumber  String?
   verificationType    Int      @default(1) // 0=Fingerprint, 1=Face, 2=Card, 3=Password, 4=Multi
   verificationScore   Int      @default(0)
+  photo               String?  // Base64-encoded face image (if available from device)
   notes               String?
   isSynced            Boolean  @default(true)
   syncedDate          DateTime @default(now())

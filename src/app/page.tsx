@@ -131,11 +131,13 @@ export default function AttendanceDashboard() {
 
   const socketRef = useRef<Socket | null>(null);
   const recordsEndRef = useRef<HTMLDivElement>(null);
+  const usersRef = useRef<UserRow[]>([]);
 
   // ======== Data Fetchers ========
   const fetchDashboardStats = useCallback(async () => {
     try {
       const res = await fetch("/api/attendance/dashboard-stats");
+      if (!res.ok) { console.error("Stats fetch HTTP error:", res.status); return; }
       const json = await res.json();
       if (json.success) setStats(json.data);
     } catch (e) {
@@ -143,11 +145,35 @@ export default function AttendanceDashboard() {
     }
   }, []);
 
+  const makeRecordKey = (r: AttendanceRecord) => `${r.userId}-${new Date(r.timestamp).getTime()}`;
+
+  const timestampsMatch = (ts1: string, ts2: string, windowMs = 2000) => {
+    const t1 = new Date(ts1).getTime();
+    const t2 = new Date(ts2).getTime();
+    return Math.abs(t1 - t2) <= windowMs;
+  };
+
   const fetchTodayRecords = useCallback(async () => {
     try {
       const res = await fetch("/api/attendance/today");
+      if (!res.ok) { console.error("Records fetch HTTP error:", res.status); return; }
       const json = await res.json();
-      if (json.success) setRecords(json.data);
+      if (json.success) {
+        setRecords((prev) => {
+          const dbRecords: AttendanceRecord[] = json.data;
+          // Use composite key with ±2s window for matching
+          const pendingWs = prev.filter((wsRec) => {
+            const isInDb = dbRecords.some((dbRec) => 
+              dbRec.userId === wsRec.userId && timestampsMatch(dbRec.timestamp, wsRec.timestamp)
+            );
+            const isRecent = (Date.now() - new Date(wsRec.timestamp).getTime()) < 60000;
+            return !isInDb && isRecent;
+          });
+          return [...dbRecords, ...pendingWs].sort(
+            (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+          );
+        });
+      }
     } catch (e) {
       console.error("Records fetch error:", e);
     }
@@ -156,6 +182,7 @@ export default function AttendanceDashboard() {
   const fetchUsers = useCallback(async () => {
     try {
       const res = await fetch("/api/users");
+      if (!res.ok) { console.error("Users fetch HTTP error:", res.status); return; }
       const json = await res.json();
       if (json.success) setUsers(json.data);
     } catch (e) {
@@ -166,6 +193,7 @@ export default function AttendanceDashboard() {
   const fetchDevices = useCallback(async () => {
     try {
       const res = await fetch("/api/devices");
+      if (!res.ok) { console.error("Devices fetch HTTP error:", res.status); return; }
       const json = await res.json();
       if (json.success) setDevices(json.data);
     } catch (e) {
@@ -176,6 +204,7 @@ export default function AttendanceDashboard() {
   const fetchReport = useCallback(async (year: number, month: number) => {
     try {
       const res = await fetch(`/api/attendance/report/monthly?year=${year}&month=${month}`);
+      if (!res.ok) { console.error("Report fetch HTTP error:", res.status); return; }
       const json = await res.json();
       if (json.success) setReport(json.data);
     } catch (e) {
@@ -189,9 +218,14 @@ export default function AttendanceDashboard() {
     return () => clearInterval(timer);
   }, []);
 
+  // Keep usersRef in sync for WS handler (avoids stale closure)
+  useEffect(() => {
+    usersRef.current = users;
+  }, [users]);
+
   // ======== WebSocket ========
   useEffect(() => {
-    const socket = io("/?XTransformPort=3003", {
+    const socket = io("http://localhost:3003", {
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: 20,
@@ -212,13 +246,46 @@ export default function AttendanceDashboard() {
       setClientCount(count);
     });
 
-    socket.on("attendanceRecorded", (record: AttendanceRecord) => {
-      setRecords((prev) => [record, ...prev].slice(0, 100));
-      toast.success(`${record.status === "CheckIn" ? "Check-In" : "Check-Out"}: ${record.userName || record.employeeId}`, {
+    socket.on("attendanceRecorded", (raw: Record<string, unknown>) => {
+      // Enrich: convert numeric status/type to strings, add employee info from local users state
+      const statusNum = raw.status as number | string;
+      const statusStr = statusNum === 0 || statusNum === "CheckIn" ? "CheckIn" : "CheckOut";
+
+      const vtNum = raw.verificationType as number | string;
+      let vtStr = "FaceRecognition";
+      if (vtNum === 0 || vtNum === "Fingerprint") vtStr = "Fingerprint";
+      else if (vtNum === 2 || vtNum === "Card") vtStr = "Card";
+      else if (vtNum === 3 || vtNum === "Password") vtStr = "Password";
+
+      const uid = Number(raw.userId);
+      const matched = usersRef.current.find((u) => u.userId === uid);
+
+      const record: AttendanceRecord = {
+        id: Number(raw.id) || Date.now(),
+        userId: uid,
+        employeeId: (raw.employeeId as string) || matched?.employeeId || String(uid),
+        userName: (raw.userName as string) || matched?.name || "-",
+        department: (raw.department as string) || matched?.department || undefined,
+        timestamp: (raw.timestamp as string) || new Date().toISOString(),
+        status: statusStr,
+        verificationType: vtStr,
+        verificationScore: Number(raw.verificationScore) || 0,
+        deviceSerialNumber: (raw.deviceSerialNumber as string) || undefined,
+        hasImage: false,
+      };
+
+      setRecords((prev) => {
+        // Dedup by (userId, timestamp ±2s) instead of exact ID match
+        const isDuplicate = prev.some((r) => 
+          r.userId === record.userId && timestampsMatch(r.timestamp, record.timestamp)
+        );
+        if (isDuplicate) return prev;
+        return [record, ...prev].slice(0, 100);
+      });
+      toast.success(`${statusStr === "CheckIn" ? "Check-In" : "Check-Out"}: ${record.userName || record.employeeId}`, {
         description: `${new Date(record.timestamp).toLocaleTimeString()} via ${record.verificationType} (${record.verificationScore}%)`,
         duration: 4000,
       });
-      // Refresh stats
       fetchDashboardStats();
     });
 
@@ -252,6 +319,15 @@ export default function AttendanceDashboard() {
     };
     loadAll();
   }, [fetchDashboardStats, fetchTodayRecords, fetchUsers, fetchDevices, fetchReport]);
+
+  // ======== Auto-refresh every 8s ========
+  useEffect(() => {
+    const poll = setInterval(() => {
+      fetchTodayRecords();
+      fetchDashboardStats();
+    }, 8000);
+    return () => clearInterval(poll);
+  }, [fetchTodayRecords, fetchDashboardStats]);
 
   // ======== Simulate Check-in ========
   const simulateCheckin = () => {
