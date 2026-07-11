@@ -142,7 +142,9 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Push to WebSocket (best-effort) — THIS is the single source of truth
+    // Push to WebSocket BEFORE returning response
+    const wsPushPromises: Promise<void>[] = [];
+
     if (created.length > 0) {
       const userIds = [...new Set(created.map((r) => r.userId))];
       const users = await db.employee.findMany({
@@ -151,30 +153,45 @@ export async function POST(request: NextRequest) {
       });
       const userMap = new Map(users.map((u) => [u.id, u]));
 
-      for (const rec of created) {
-        const user = userMap.get(rec.userId);
-        pushToWs({
+      // Map created records back to their original input values to get status/type
+      // The `created` array only contains {id, userId, timestamp}. We need the original input from `newRecords`.
+      const createdRecordDetails = created.map(createdRec => {
+        // Find the original record from newRecords that matches this created record's unique properties
+        const originalInput = newRecords.find(inputRec => 
+          inputRec.userId === createdRec.userId && 
+          inputRec.timestamp.getTime() === createdRec.timestamp.getTime() // Check exact ms timestamp
+        );
+        // Merge: DB ID + original input details (status, verificationType, etc.)
+        return { ...originalInput, ...createdRec }; 
+      });
+
+      for (const recWithDetails of createdRecordDetails) {
+        const user = userMap.get(recWithDetails.userId);
+        wsPushPromises.push(pushToWs({ // Collect the promise
           type: "attendance",
           record: {
-            id: rec.id,
-            userId: rec.userId,
+            id: recWithDetails.id, // Use DB generated ID
+            userId: recWithDetails.userId,
             employeeId: user?.employeeId,
             userName: user?.name,
             department: user?.department,
-            timestamp: rec.timestamp.toISOString(),
-            status: 0,
-            verificationType: 1,
-            verificationScore: 0,
+            timestamp: recWithDetails.timestamp.toISOString(), // Use timestamp from DB object (already ISO string)
+            status: recWithDetails.status ?? 0, // Use status from original input
+            verificationType: recWithDetails.verificationType ?? 1, // Use type from original input
+            verificationScore: recWithDetails.verificationScore ?? 0,
             deviceSerialNumber: serial,
           },
-        });
+        }));
       }
 
-      pushToWs({
+      wsPushPromises.push(pushToWs({ // Collect the promise for sync event
         type: "sync",
         info: { deviceSerial: serial, inserted },
-      });
+      }));
     }
+    
+    // Wait for all push operations to complete
+    await Promise.allSettled(wsPushPromises);
 
     return NextResponse.json({
       success: true,

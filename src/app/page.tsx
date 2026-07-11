@@ -151,18 +151,52 @@ export default function AttendanceDashboard() {
     return Math.abs(t1 - t2) <= windowMs;
   };
 
-  const fetchTodayRecords = useCallback(async () => {
-    try {
-      const res = await fetch("/api/attendance/today");
-      if (!res.ok) { console.error("Records fetch HTTP error:", res.status); return; }
-      const json = await res.json();
-      if (json.success) {
-        setRecords(json.data);
-      }
-    } catch (e) {
-      console.error("Records fetch error:", e);
-    }
-  }, []);
+   const fetchTodayRecords = useCallback(async () => {
+     try {
+       const res = await fetch("/api/attendance/today");
+       if (!res.ok) { console.error("Records fetch HTTP error:", res.status); return; }
+       const json = await res.json();
+       if (json.success) {
+         const dbRecords: AttendanceRecord[] = json.data;
+
+         // --- BUG A FIX: Merge DB records with current WS records ---
+         // Keep WS records that are within 2 minutes or also present in DB
+         const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+         const mergedRecords = [
+           ...dbRecords, // Start with DB records
+           ...records.filter(wsRecord => { // Add WS records that are not in DB OR are recent
+             const isWsRecordWithinExpiry = new Date(wsRecord.timestamp) >= twoMinutesAgo;
+             const isWsRecordInDb = dbRecords.some(dbRec => 
+               dbRec.userId === wsRecord.userId && 
+               timestampsMatch(dbRec.timestamp, wsRecord.timestamp)
+             );
+             return isWsRecordWithinExpiry && !isWsRecordInDb;
+           })
+         ].slice(0, 100); // Limit to avoid excessively large state
+
+         // Remove duplicates from the merged list (prioritize WS record if timestamps match exactly)
+         const finalRecordsMap = new Map<string, AttendanceRecord>();
+         mergedRecords.forEach(rec => {
+           // Use a more precise key to avoid overwriting slightly different timestamps if they are within match window
+           const key = `${rec.userId}-${rec.timestamp}`; 
+           if (!finalRecordsMap.has(key)) {
+             finalRecordsMap.set(key, rec);
+           } else {
+             // If duplicate key, prefer WS record if it has more enriched data (like name/dept)
+             // or if it's the latest timestamp within the window.
+             // For now, simple overwrite by last seen:
+             finalRecordsMap.set(key, rec);
+           }
+         });
+         setRecords(Array.from(finalRecordsMap.values()));
+         // --- END BUG A FIX ---
+       }
+     } catch (e) {
+       console.error("Records fetch error:", e);
+     }
+   }, [records]); // Include 'records' in dependency array for the merge logic
+
+
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -210,29 +244,27 @@ export default function AttendanceDashboard() {
 
   // ======== WebSocket ========
   useEffect(() => {
-    const socket = io("http://localhost:3003", {
+    const socketInstance = io("http://localhost:3003", {
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: 20,
       reconnectionDelay: 2000,
     });
-    socketRef.current = socket;
+    socketRef.current = socketInstance;
 
-    socket.on("connect", () => {
+    socketInstance.on("connect", () => {
       setConnected(true);
-      console.log("WebSocket connected");
     });
 
-    socket.on("disconnect", () => {
+    socketInstance.on("disconnect", () => {
       setConnected(false);
     });
 
-    socket.on("clientCountChanged", (count: number) => {
+    socketInstance.on("clientCountChanged", (count: number) => {
       setClientCount(count);
     });
 
-    socket.on("attendanceRecorded", (raw: Record<string, unknown>) => {
-      // Enrich: convert numeric status/type to strings, add employee info from local users state
+    socketInstance.on("attendanceRecorded", (raw: Record<string, unknown>) => {
       const statusNum = raw.status as number | string;
       const statusStr = statusNum === 0 || statusNum === "CheckIn" ? "CheckIn" : "CheckOut";
 
@@ -264,7 +296,6 @@ export default function AttendanceDashboard() {
           r.userId === record.userId && timestampsMatch(r.timestamp, record.timestamp)
         );
         if (isDuplicate) {
-          // Replace the duplicate with the WS version (has name, dept enriched)
           return prev.map((r) => 
             r.userId === record.userId && timestampsMatch(r.timestamp, record.timestamp) ? record : r
           );
@@ -276,19 +307,22 @@ export default function AttendanceDashboard() {
         duration: 4000,
       });
       fetchDashboardStats();
+      fetchTodayRecords();
     });
 
-    socket.on("recordsSynced", (info: { deviceSerial: string; inserted: number }) => {
+    socketInstance.on("recordsSynced", (info: { deviceSerial: string; inserted: number }) => {
       toast.success(`Synced ${info.inserted} records from ${info.deviceSerial}`);
       fetchDashboardStats();
+      fetchTodayRecords();
     });
 
-    socket.on("deviceStatusChanged", (info: unknown) => {
+    socketInstance.on("deviceStatusChanged", () => {
       fetchDevices();
     });
 
     return () => {
-      socket.disconnect();
+      socketInstance.disconnect();
+      socketRef.current = null;
     };
   }, [fetchDashboardStats, fetchTodayRecords, fetchDevices]);
 
