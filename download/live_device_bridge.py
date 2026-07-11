@@ -149,7 +149,7 @@ class LiveDeviceBridge:
         self.user_map = {int(k): v for k, v in user_map.items()}
         self.logger = logger
         self.last_uid = 0
-        self.last_timestamp = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_timestamp = None
         self.known_records: set = set()  # unused, kept for backward compat
         self.running = True
 
@@ -240,7 +240,6 @@ class LiveDeviceBridge:
             if self.last_timestamp and timestamp <= self.last_timestamp:
                 return
 
-            # Don't update last_timestamp here — let push_to_backend success handle it
             backend_user_id = self.resolve_user_id(user_id)
             if backend_user_id is None:
                 self.logger.warning(f"Skipping real-time event: no mapping for device user {user_id}")
@@ -254,6 +253,9 @@ class LiveDeviceBridge:
                 "verificationType": 1,
                 "verificationScore": 0,
             }])
+
+            if success:
+                self.last_timestamp = self._normalize_ts(timestamp)
 
             self.logger.info(f"Real-time event: User {user_id} at {timestamp}")
 
@@ -420,6 +422,7 @@ class LiveDeviceBridge:
 
         while self.running:
             conn = None
+            rt_conn = None
             try:
                 conn = self.connect()
                 if not conn:
@@ -441,6 +444,22 @@ class LiveDeviceBridge:
                 conn = None
                 if device_users is not None:
                     self.sync_users_to_backend(device_users)
+
+                # Start real-time event listener on a SEPARATE connection
+                try:
+                    rt_conn = self.connect()
+                    if rt_conn:
+                        rt_thread = self.start_realtime_listener(rt_conn)
+                        if rt_thread:
+                            self.logger.info("Real-time event listener started on separate connection")
+                except Exception as e:
+                    self.logger.warning(f"Could not start real-time listener: {e}")
+                    if rt_conn:
+                        try:
+                            rt_conn.disconnect()
+                        except:
+                            pass
+                    rt_conn = None
 
                 # Reconnect for periodic full sync (fallback / gap recovery)
                 conn = self.connect()
@@ -540,6 +559,12 @@ class LiveDeviceBridge:
             except Exception as e:
                 self.logger.error(f"Main loop error: {e}")
             finally:
+                if rt_conn:
+                    try:
+                        rt_conn.disconnect()
+                    except:
+                        pass
+                rt_conn = None
                 if conn:
                     try:
                         conn.enable_device()

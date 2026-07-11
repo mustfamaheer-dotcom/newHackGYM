@@ -145,8 +145,6 @@ export default function AttendanceDashboard() {
     }
   }, []);
 
-  const makeRecordKey = (r: AttendanceRecord) => `${r.userId}-${new Date(r.timestamp).getTime()}`;
-
   const timestampsMatch = (ts1: string, ts2: string, windowMs = 5000) => {
     const t1 = new Date(ts1).getTime();
     const t2 = new Date(ts2).getTime();
@@ -159,20 +157,7 @@ export default function AttendanceDashboard() {
       if (!res.ok) { console.error("Records fetch HTTP error:", res.status); return; }
       const json = await res.json();
       if (json.success) {
-        setRecords((prev) => {
-          const dbRecords: AttendanceRecord[] = json.data;
-          // Use composite key with ±2s window for matching
-          const pendingWs = prev.filter((wsRec) => {
-            const isInDb = dbRecords.some((dbRec) => 
-              dbRec.userId === wsRec.userId && timestampsMatch(dbRec.timestamp, wsRec.timestamp)
-            );
-            const isRecent = (Date.now() - new Date(wsRec.timestamp).getTime()) < 300000;
-            return !isInDb && isRecent;
-          });
-          return [...dbRecords, ...pendingWs].sort(
-            (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-          );
-        });
+        setRecords(json.data);
       }
     } catch (e) {
       console.error("Records fetch error:", e);
@@ -275,11 +260,15 @@ export default function AttendanceDashboard() {
       };
 
       setRecords((prev) => {
-        // Dedup by (userId, timestamp ±2s) instead of exact ID match
         const isDuplicate = prev.some((r) => 
           r.userId === record.userId && timestampsMatch(r.timestamp, record.timestamp)
         );
-        if (isDuplicate) return prev;
+        if (isDuplicate) {
+          // Replace the duplicate with the WS version (has name, dept enriched)
+          return prev.map((r) => 
+            r.userId === record.userId && timestampsMatch(r.timestamp, record.timestamp) ? record : r
+          );
+        }
         return [record, ...prev].slice(0, 100);
       });
       toast.success(`${statusStr === "CheckIn" ? "Check-In" : "Check-Out"}: ${record.userName || record.employeeId}`, {
@@ -292,7 +281,6 @@ export default function AttendanceDashboard() {
     socket.on("recordsSynced", (info: { deviceSerial: string; inserted: number }) => {
       toast.success(`Synced ${info.inserted} records from ${info.deviceSerial}`);
       fetchDashboardStats();
-      fetchTodayRecords();
     });
 
     socket.on("deviceStatusChanged", (info: unknown) => {
