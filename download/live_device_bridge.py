@@ -240,29 +240,16 @@ class LiveDeviceBridge:
             if self.last_timestamp and timestamp <= self.last_timestamp:
                 return
 
-            self.last_timestamp = timestamp
+            # Don't update last_timestamp here — let push_to_backend success handle it
             backend_user_id = self.resolve_user_id(user_id)
             if backend_user_id is None:
                 self.logger.warning(f"Skipping real-time event: no mapping for device user {user_id}")
                 return
 
-            record = {
-                "id": uid,
+            # Push to backend (it handles DB save + WS broadcast)
+            success, _ = self.push_to_backend([{
                 "userId": backend_user_id,
-                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
-                "status": 0 if punch in (0, 3, 4) else 1,
-                "verificationType": 1,
-                "verificationScore": 0,
-                "deviceSerialNumber": self.device_cfg.serial_number,
-            }
-
-            # Instant push to WebSocket
-            self.push_to_websocket(record)
-
-            # Batch push to backend
-            self.push_to_backend([{
-                "userId": backend_user_id,
-                "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp),
+                "timestamp": self._ts_to_iso_str(timestamp),
                 "status": 0 if punch in (0, 3, 4) else 1,
                 "verificationType": 1,
                 "verificationScore": 0,
@@ -503,16 +490,17 @@ class LiveDeviceBridge:
                                     continue
                             new_records.append(r)
 
+                        success = False
                         if new_records:
                             self.logger.info(
                                 f"Periodic sync found {len(new_records)} new record(s)!"
                             )
 
-                            # Batch push to backend API FIRST (so record persists in DB)
+                            # Batch push to backend API (it handles DB save + WS broadcast)
                             batch = [
                                 {
                                     "userId": self.resolve_user_id(r.user_id) or r.user_id,
-                                    "timestamp": r.timestamp.isoformat() if hasattr(r.timestamp, "isoformat") else str(r.timestamp),
+                                    "timestamp": self._ts_to_iso_str(r.timestamp),
                                     "status": 0 if r.punch in (0, 3, 4) else 1,
                                     "verificationType": 1,
                                     "verificationScore": 0,
@@ -521,9 +509,8 @@ class LiveDeviceBridge:
                                 for r in new_records
                                 if self.resolve_user_id(r.user_id) is not None
                             ]
-                            created_records = []
                             if batch:
-                                success, created_records = self.push_to_backend(batch)
+                                success, _ = self.push_to_backend(batch)
                                 if success:
                                     # Clear device attendance log so next poll is instant
                                     try:
@@ -532,42 +519,10 @@ class LiveDeviceBridge:
                                     except Exception as e:
                                         self.logger.warning(f"Failed to clear attendance log: {e}")
 
-                            # THEN push to WebSocket with CORRECT DB IDs from backend
-                            if created_records:
-                                # Build lookup map: (userId, normalized_timestamp) -> id
-                                created_map = {}
-                                for cr in created_records:
-                                    cr_uid = cr.get("userId")
-                                    cr_ts = cr.get("timestamp")
-                                    if cr_uid is not None and cr_ts:
-                                        norm_ts = self._ts_to_iso_str(cr_ts)
-                                        created_map[(cr_uid, norm_ts)] = cr["id"]
-
-                                for r in sorted(new_records, key=lambda x: x.timestamp):
-                                    backend_user_id = self.resolve_user_id(r.user_id)
-                                    if backend_user_id is None:
-                                        continue
-
-                                    # Find matching created record by userId + normalized timestamp
-                                    norm_ts = self._ts_to_iso_str(r.timestamp)
-                                    db_id = created_map.get((backend_user_id, norm_ts), r.uid)
-
-                                    record = {
-                                        "id": db_id,  # Use DB auto-increment ID
-                                        "userId": backend_user_id,
-                                        "timestamp": norm_ts,
-                                        "status": 0 if r.punch in (0, 3, 4) else 1,
-                                        "verificationType": 1,
-                                        "verificationScore": 0,
-                                        "photo": None,
-                                        "deviceSerialNumber": self.device_cfg.serial_number,
-                                    }
-                                    self.push_to_websocket(record)
-
-                        if records:
+                        # Only advance last_timestamp if backend push succeeded
+                        if success and records:
                             max_ts = max(self._normalize_ts(r.timestamp) for r in records)
-                            if max_ts > self.last_timestamp:
-                                self.last_timestamp = max_ts
+                            self.last_timestamp = max_ts
 
                     except Exception as e:
                         self.logger.error(f"Polling error: {e}")

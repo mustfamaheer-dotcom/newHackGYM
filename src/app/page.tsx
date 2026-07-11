@@ -147,7 +147,7 @@ export default function AttendanceDashboard() {
 
   const makeRecordKey = (r: AttendanceRecord) => `${r.userId}-${new Date(r.timestamp).getTime()}`;
 
-  const timestampsMatch = (ts1: string, ts2: string, windowMs = 2000) => {
+  const timestampsMatch = (ts1: string, ts2: string, windowMs = 5000) => {
     const t1 = new Date(ts1).getTime();
     const t2 = new Date(ts2).getTime();
     return Math.abs(t1 - t2) <= windowMs;
@@ -166,7 +166,7 @@ export default function AttendanceDashboard() {
             const isInDb = dbRecords.some((dbRec) => 
               dbRec.userId === wsRec.userId && timestampsMatch(dbRec.timestamp, wsRec.timestamp)
             );
-            const isRecent = (Date.now() - new Date(wsRec.timestamp).getTime()) < 60000;
+            const isRecent = (Date.now() - new Date(wsRec.timestamp).getTime()) < 300000;
             return !isInDb && isRecent;
           });
           return [...dbRecords, ...pendingWs].sort(

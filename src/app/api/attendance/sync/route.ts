@@ -1,6 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 
+async function pushToWs(event: Record<string, unknown>): Promise<void> {
+  try {
+    await fetch("http://localhost:3004/push-event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    });
+  } catch {
+    // best-effort
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -40,7 +52,7 @@ export async function POST(request: NextRequest) {
       const ids = Array.from(userIdsToEnsure);
       const existing = await db.employee.findMany({
         where: { id: { in: ids } },
-        select: { id: true },
+        select: { id: true, employeeId: true, name: true, department: true },
       });
       const existingIds = new Set(existing.map((e) => e.id));
       const missing = ids.filter((id) => !existingIds.has(id));
@@ -127,6 +139,40 @@ export async function POST(request: NextRequest) {
       await db.device.updateMany({
         where: { serialNumber: deviceSerialNumber },
         data: { lastSyncedDate: new Date(), status: 1 },
+      });
+    }
+
+    // Push to WebSocket (best-effort) — THIS is the single source of truth
+    if (created.length > 0) {
+      const userIds = [...new Set(created.map((r) => r.userId))];
+      const users = await db.employee.findMany({
+        where: { id: { in: userIds } },
+        select: { id: true, employeeId: true, name: true, department: true },
+      });
+      const userMap = new Map(users.map((u) => [u.id, u]));
+
+      for (const rec of created) {
+        const user = userMap.get(rec.userId);
+        pushToWs({
+          type: "attendance",
+          record: {
+            id: rec.id,
+            userId: rec.userId,
+            employeeId: user?.employeeId,
+            userName: user?.name,
+            department: user?.department,
+            timestamp: rec.timestamp.toISOString(),
+            status: 0,
+            verificationType: 1,
+            verificationScore: 0,
+            deviceSerialNumber: serial,
+          },
+        });
+      }
+
+      pushToWs({
+        type: "sync",
+        info: { deviceSerial: serial, inserted },
       });
     }
 
